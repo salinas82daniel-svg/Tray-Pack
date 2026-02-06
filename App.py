@@ -113,12 +113,12 @@ def _build_in_list_sql(values: list[str]) -> str:
 
 
 def sql_int_expr(col_name: str) -> str:
-    """Old-SQL-safe: returns INT or NULL."""
+    """Old-SQL-safe: returns INT or NULL (no TRY_CONVERT)."""
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS INT) ELSE NULL END)"
 
 
 def sql_num_expr(col_name: str) -> str:
-    """Old-SQL-safe: returns numeric (FLOAT) or 0."""
+    """Old-SQL-safe: returns FLOAT numeric or 0 (handles nchar/varchar quantities)."""
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS FLOAT) ELSE 0 END)"
 
 
@@ -189,7 +189,7 @@ def run_diagnostics(conn, schedule_date: date, statuses: list[str]) -> dict:
     """
     so_sample = pd.read_sql(sql_samples_so, conn, params=params)
 
-    sql_samples_detail = f"""
+    sql_samples_detail = """
     WITH OrdersForDay AS (
         SELECT so.TxnID
         FROM WPL.dbo.GP_SalesOrder so
@@ -238,7 +238,9 @@ def fetch_shortsheets(conn, schedule_date: date, statuses: list[str], only_remai
     d_qty = sql_num_expr("d.Quantity")
     s_qty = sql_num_expr("s.QtyShipped")
 
-    where_remaining = "WHERE (oa.QtyOrdered - ISNULL(sa.QtyShipped,0)) > 0" if only_remaining else ""
+    # Remaining = Ordered - Shipped - Available
+    remaining_expr = "(oa.QtyOrdered - ISNULL(sa.QtyShipped,0) - ISNULL(ia.AvailableCases,0))"
+    where_remaining = f"WHERE {remaining_expr} > 0" if only_remaining else ""
 
     sql = f"""
     WITH OrdersForDay AS (
@@ -280,7 +282,7 @@ def fetch_shortsheets(conn, schedule_date: date, statuses: list[str], only_remai
         oa.QtyOrdered,
         ISNULL(sa.QtyShipped,0) AS QtyShipped,
         ISNULL(ia.AvailableCases,0) AS AvailableCases,
-        (oa.QtyOrdered - ISNULL(sa.QtyShipped,0)) AS RemainingCases
+        {remaining_expr} AS RemainingCases
     FROM OrderedAgg oa
     LEFT JOIN ShippedAgg sa ON sa.PLU_Int = oa.PLU_Int
     LEFT JOIN InvAgg ia ON ia.PLU_Int = oa.PLU_Int
@@ -294,9 +296,14 @@ def fetch_shortsheets(conn, schedule_date: date, statuses: list[str], only_remai
     if df.empty:
         return df
 
-    # Format PLU as 5 digits (00269)
+    # Keep both numeric and padded forms
+    df["ProductNumber"] = df["PLU_Int"].astype(int)
     df["PLU"] = df["PLU_Int"].astype(int).astype(str).str.zfill(5)
     df = df.drop(columns=["PLU_Int"])
+
+    # keep Remaining non-negative
+    df["RemainingCases"] = df["RemainingCases"].apply(lambda x: x if x > 0 else 0)
+
     return df
 
 
@@ -360,7 +367,7 @@ def merge_master(short_df: pd.DataFrame, master_df: pd.DataFrame) -> pd.DataFram
     if mcols["desc"] and mcols["desc"] in merged.columns:
         merged = merged.rename(columns={mcols["desc"]: "ProductDescription"})
 
-    desired = ["PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
+    desired = ["ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
     cols = [c for c in desired if c in merged.columns] + [c for c in merged.columns if c not in desired]
     return merged[cols]
 
