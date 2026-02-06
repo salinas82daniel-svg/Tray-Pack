@@ -14,7 +14,7 @@ except ImportError:
     pyodbc = None
 
 
-APP_NAME = "Shortsheet Builder"
+APP_NAME = "Shortsheet Builder (TxnDate)"
 CONFIG_FILE = "config.json"
 
 
@@ -112,41 +112,40 @@ def _build_in_list_sql(values: list[str]) -> str:
     return ", ".join(escaped)
 
 
-# Old-SQL-safe numeric-to-int expression
 def sql_int_expr(col_name: str) -> str:
-    """
-    Returns a SQL expression that yields INT or NULL without TRY_CONVERT.
-    Works on older SQL Server:
-      CASE WHEN ISNUMERIC(col)=1 THEN CAST(col AS INT) ELSE NULL END
-    """
+    """Old-SQL-safe: returns INT or NULL."""
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS INT) ELSE NULL END)"
 
 
-# -----------------------------
-# Queries
-# -----------------------------
-def run_diagnostics(conn, schedule_date: date, so_date_field: str, statuses: list[str]) -> dict:
-    allowed = {"TxnDate", "ShipDate", "DueDate", "TimeCreated"}
-    if so_date_field not in allowed:
-        raise ValueError(f"Invalid SO date field '{so_date_field}'")
+def sql_num_expr(col_name: str) -> str:
+    """Old-SQL-safe: returns numeric (FLOAT) or 0."""
+    return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS FLOAT) ELSE 0 END)"
 
+
+# -----------------------------
+# Queries (TxnDate only)
+# -----------------------------
+def run_diagnostics(conn, schedule_date: date, statuses: list[str]) -> dict:
     status_sql = _build_in_list_sql(statuses if statuses else ["Available"])
 
     d_plu = sql_int_expr("d.ItemRef_FullName")
     s_plu = sql_int_expr("s.ProductNumber")
     w_plu = sql_int_expr("w.plu")
 
+    d_qty = sql_num_expr("d.Quantity")
+    s_qty = sql_num_expr("s.QtyShipped")
+
     sql_counts = f"""
     WITH OrdersForDay AS (
         SELECT so.TxnID
         FROM WPL.dbo.GP_SalesOrder so
-        WHERE so.{so_date_field} >= CAST(? AS DATETIME)
-          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS DATETIME))
+        WHERE so.TxnDate >= CAST(? AS DATETIME)
+          AND so.TxnDate <  DATEADD(day, 1, CAST(? AS DATETIME))
     ),
     OrderedAgg AS (
         SELECT
             {d_plu} AS PLU_Int,
-            SUM(ISNULL(d.Quantity,0)) AS QtyOrdered
+            SUM({d_qty}) AS QtyOrdered
         FROM WPL.dbo.GP_SalesOrderLineDetail d
         JOIN OrdersForDay o ON o.TxnID = d.TxnIDKey
         WHERE {d_plu} IS NOT NULL
@@ -155,7 +154,7 @@ def run_diagnostics(conn, schedule_date: date, so_date_field: str, statuses: lis
     ShippedAgg AS (
         SELECT
             {s_plu} AS PLU_Int,
-            SUM(ISNULL(s.QtyShipped,0)) AS QtyShipped
+            SUM({s_qty}) AS QtyShipped
         FROM WPL.dbo.Shipped s
         JOIN OrdersForDay o ON o.TxnID = s.OrderNum
         WHERE {s_plu} IS NOT NULL
@@ -181,11 +180,11 @@ def run_diagnostics(conn, schedule_date: date, so_date_field: str, statuses: lis
     params = (schedule_date.isoformat(), schedule_date.isoformat())
     counts = pd.read_sql(sql_counts, conn, params=params).iloc[0].to_dict()
 
-    sql_samples_so = f"""
-    SELECT TOP 10 so.TxnID, so.{so_date_field} AS DateValue
+    sql_samples_so = """
+    SELECT TOP 10 so.TxnID, so.TxnDate
     FROM WPL.dbo.GP_SalesOrder so
-    WHERE so.{so_date_field} >= CAST(? AS DATETIME)
-      AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS DATETIME))
+    WHERE so.TxnDate >= CAST(? AS DATETIME)
+      AND so.TxnDate <  DATEADD(day, 1, CAST(? AS DATETIME))
     ORDER BY so.TxnID;
     """
     so_sample = pd.read_sql(sql_samples_so, conn, params=params)
@@ -194,8 +193,8 @@ def run_diagnostics(conn, schedule_date: date, so_date_field: str, statuses: lis
     WITH OrdersForDay AS (
         SELECT so.TxnID
         FROM WPL.dbo.GP_SalesOrder so
-        WHERE so.{so_date_field} >= CAST(? AS DATETIME)
-          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS DATETIME))
+        WHERE so.TxnDate >= CAST(? AS DATETIME)
+          AND so.TxnDate <  DATEADD(day, 1, CAST(? AS DATETIME))
     )
     SELECT TOP 10
         d.TxnIDKey,
@@ -226,11 +225,7 @@ def run_diagnostics(conn, schedule_date: date, so_date_field: str, statuses: lis
     }
 
 
-def fetch_shortsheets(conn, schedule_date: date, so_date_field: str, statuses: list[str], only_remaining: bool) -> pd.DataFrame:
-    allowed = {"TxnDate", "ShipDate", "DueDate", "TimeCreated"}
-    if so_date_field not in allowed:
-        raise ValueError(f"Invalid SO date field '{so_date_field}'")
-
+def fetch_shortsheets(conn, schedule_date: date, statuses: list[str], only_remaining: bool) -> pd.DataFrame:
     if not statuses:
         statuses = ["Available"]
 
@@ -240,19 +235,22 @@ def fetch_shortsheets(conn, schedule_date: date, so_date_field: str, statuses: l
     s_plu = sql_int_expr("s.ProductNumber")
     w_plu = sql_int_expr("w.plu")
 
+    d_qty = sql_num_expr("d.Quantity")
+    s_qty = sql_num_expr("s.QtyShipped")
+
     where_remaining = "WHERE (oa.QtyOrdered - ISNULL(sa.QtyShipped,0)) > 0" if only_remaining else ""
 
     sql = f"""
     WITH OrdersForDay AS (
         SELECT so.TxnID
         FROM WPL.dbo.GP_SalesOrder so
-        WHERE so.{so_date_field} >= CAST(? AS DATETIME)
-          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS DATETIME))
+        WHERE so.TxnDate >= CAST(? AS DATETIME)
+          AND so.TxnDate <  DATEADD(day, 1, CAST(? AS DATETIME))
     ),
     OrderedAgg AS (
         SELECT
             {d_plu} AS PLU_Int,
-            SUM(ISNULL(d.Quantity,0)) AS QtyOrdered
+            SUM({d_qty}) AS QtyOrdered
         FROM WPL.dbo.GP_SalesOrderLineDetail d
         JOIN OrdersForDay o ON o.TxnID = d.TxnIDKey
         WHERE {d_plu} IS NOT NULL
@@ -261,7 +259,7 @@ def fetch_shortsheets(conn, schedule_date: date, so_date_field: str, statuses: l
     ShippedAgg AS (
         SELECT
             {s_plu} AS PLU_Int,
-            SUM(ISNULL(s.QtyShipped,0)) AS QtyShipped
+            SUM({s_qty}) AS QtyShipped
         FROM WPL.dbo.Shipped s
         JOIN OrdersForDay o ON o.TxnID = s.OrderNum
         WHERE {s_plu} IS NOT NULL
@@ -296,7 +294,7 @@ def fetch_shortsheets(conn, schedule_date: date, so_date_field: str, statuses: l
     if df.empty:
         return df
 
-    # Format PLU as 5 digits
+    # Format PLU as 5 digits (00269)
     df["PLU"] = df["PLU_Int"].astype(int).astype(str).str.zfill(5)
     df = df.drop(columns=["PLU_Int"])
     return df
@@ -383,6 +381,7 @@ class App(tk.Tk):
 
         self.cfg = load_config()
 
+        # Connection vars
         self.var_server = tk.StringVar(value=self.cfg.server)
         self.var_database = tk.StringVar(value=self.cfg.database)
         self.var_driver = tk.StringVar(value=self.cfg.driver)
@@ -390,13 +389,15 @@ class App(tk.Tk):
         self.var_user = tk.StringVar(value=self.cfg.username)
         self.var_pass = tk.StringVar(value=self.cfg.password)
 
+        # Product vars
         self.var_product_path = tk.StringVar(value=self.cfg.product_excel_path)
         self.var_product_sheet = tk.StringVar(value=self.cfg.product_sheet_name)
 
+        # Run vars (TxnDate only)
         self.var_schedule_date = tk.StringVar(value=date.today().isoformat())
-        self.var_so_date_field = tk.StringVar(value="ShipDate")
         self.var_only_remaining = tk.BooleanVar(value=True)
 
+        # WIP statuses
         self.var_wip_available = tk.BooleanVar(value=True)
         self.var_wip_scanning = tk.BooleanVar(value=True)
         self.var_wip_waiting = tk.BooleanVar(value=True)
@@ -458,19 +459,14 @@ class App(tk.Tk):
         ttk.Label(frm_prod, text="Sheet Name (optional):").grid(row=row, column=0, sticky="w", **pad)
         ttk.Entry(frm_prod, textvariable=self.var_product_sheet, width=30).grid(row=row, column=1, sticky="w", **pad)
 
-        frm_run = ttk.LabelFrame(self, text="Shortsheet Run")
+        frm_run = ttk.LabelFrame(self, text="Shortsheet Run (TxnDate)")
         frm_run.pack(fill="x", **pad)
 
         row = 0
         ttk.Label(frm_run, text="Schedule Date (YYYY-MM-DD):").grid(row=row, column=0, sticky="w", **pad)
         ttk.Entry(frm_run, textvariable=self.var_schedule_date, width=18).grid(row=row, column=1, sticky="w", **pad)
 
-        ttk.Label(frm_run, text="SO Date Field:").grid(row=row, column=2, sticky="w", **pad)
-        ttk.Combobox(frm_run, textvariable=self.var_so_date_field,
-                     values=["TxnDate", "ShipDate", "DueDate", "TimeCreated"],
-                     state="readonly", width=16).grid(row=row, column=3, sticky="w", **pad)
-
-        ttk.Checkbutton(frm_run, text="Only Remaining (>0)", variable=self.var_only_remaining).grid(row=row, column=4, sticky="w", **pad)
+        ttk.Checkbutton(frm_run, text="Only Remaining (>0)", variable=self.var_only_remaining).grid(row=row, column=2, sticky="w", **pad)
 
         row += 1
         ttk.Label(frm_run, text="WIP statuses included in AvailableCases:").grid(row=row, column=0, sticky="w", **pad)
@@ -521,8 +517,7 @@ class App(tk.Tk):
         return datetime.strptime(self.var_schedule_date.get().strip(), "%Y-%m-%d").date()
 
     def _connect(self, cfg: AppConfig):
-        cs = build_connection_string(cfg)
-        return pyodbc.connect(cs, timeout=20)
+        return pyodbc.connect(build_connection_string(cfg), timeout=20)
 
     def _get_status_list(self) -> list[str]:
         statuses = []
@@ -568,7 +563,6 @@ class App(tk.Tk):
 
         cfg = self._collect_config()
         statuses = self._get_status_list()
-        so_field = self.var_so_date_field.get().strip()
 
         try:
             sched = self._parse_date()
@@ -579,10 +573,10 @@ class App(tk.Tk):
         try:
             self._log("Connecting to SQL Server for diagnostics...")
             with self._connect(cfg) as conn:
-                diag = run_diagnostics(conn, sched, so_field, statuses)
+                diag = run_diagnostics(conn, sched, statuses)
 
             c = diag["counts"]
-            self._log(f"Diagnostics for {sched.isoformat()} using SO.{so_field}")
+            self._log(f"Diagnostics for {sched.isoformat()} using TxnDate")
             self._log(f"  SO_Count: {c.get('SO_Count')}")
             self._log(f"  OrderedPLU_Count: {c.get('OrderedPLU_Count')}")
             self._log(f"  ShippedPLU_Count: {c.get('ShippedPLU_Count')}")
@@ -590,7 +584,7 @@ class App(tk.Tk):
 
             self._log("Sample SO TxnIDs:")
             for _, r in diag["so_sample"].iterrows():
-                self._log(f"  {r['TxnID']} | {r['DateValue']}")
+                self._log(f"  {r['TxnID']} | {r['TxnDate']}")
 
             self._log("Sample SO Detail lines:")
             for _, r in diag["detail_sample"].iterrows():
@@ -614,7 +608,6 @@ class App(tk.Tk):
 
         cfg = self._collect_config()
         statuses = self._get_status_list()
-        so_field = self.var_so_date_field.get().strip()
         only_remaining = bool(self.var_only_remaining.get())
 
         try:
@@ -634,8 +627,8 @@ class App(tk.Tk):
         try:
             self._log("Connecting to SQL Server...")
             with self._connect(cfg) as conn:
-                self._log(f"Running shortsheet for {sched.isoformat()} using SO.{so_field} ...")
-                df = fetch_shortsheets(conn, sched, so_field, statuses, only_remaining)
+                self._log(f"Running shortsheet for {sched.isoformat()} using TxnDate ...")
+                df = fetch_shortsheets(conn, sched, statuses, only_remaining)
             self._log(f"Rows returned: {len(df):,}")
         except Exception as e:
             self._log("ERROR running shortsheet query:")
@@ -645,8 +638,8 @@ class App(tk.Tk):
             return
 
         if df.empty:
-            self._log("No results. Try changing SO Date Field (TxnDate vs ShipDate) and run Diagnostics.")
-            messagebox.showinfo("No Results", "No results. Try changing SO Date Field and run Diagnostics.")
+            self._log("No results returned. Run Diagnostics to confirm shipped/order joins.")
+            messagebox.showinfo("No Results", "No results returned. Run Diagnostics.")
             return
 
         try:
@@ -658,7 +651,7 @@ class App(tk.Tk):
         try:
             out_folder = cfg.output_folder or os.getcwd()
             os.makedirs(out_folder, exist_ok=True)
-            out_path = os.path.join(out_folder, f"Shortsheet_{so_field}_{sched.isoformat()}.xlsx")
+            out_path = os.path.join(out_folder, f"Shortsheet_TxnDate_{sched.isoformat()}.xlsx")
             self._log(f"Exporting: {out_path}")
             export_to_excel(df, out_path)
             self._log("Export complete.")
