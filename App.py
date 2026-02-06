@@ -1,6 +1,5 @@
 import json
 import os
-import sys
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, date
@@ -42,7 +41,6 @@ def load_config() -> AppConfig:
                 data = json.load(f)
             return AppConfig(**{**AppConfig().__dict__, **data})
         except Exception:
-            # If config is corrupt, start fresh
             return AppConfig()
     return AppConfig()
 
@@ -60,37 +58,30 @@ def list_odbc_drivers() -> list[str]:
         return []
     try:
         drivers = pyodbc.drivers()
-        # Favor common SQL Server drivers at top
-        preferred = []
-        other = []
+        preferred, other = [], []
         for d in drivers:
             if "SQL Server" in d or "ODBC Driver" in d:
                 preferred.append(d)
             else:
                 other.append(d)
-        return preferred[::-1] + other  # reverse preferred so newest typically higher (often)
+        return preferred[::-1] + other
     except Exception:
         return []
 
 
 def build_connection_string(cfg: AppConfig) -> str:
-    # Example drivers:
-    # - "ODBC Driver 18 for SQL Server"
-    # - "ODBC Driver 17 for SQL Server"
-    # - "SQL Server"
     if not cfg.driver:
         raise ValueError("ODBC Driver is blank. Select an installed SQL Server ODBC driver.")
+    if not cfg.server:
+        raise ValueError("Server Address is blank.")
 
     base = f"DRIVER={{{cfg.driver}}};SERVER={cfg.server};DATABASE={cfg.database};"
 
     if cfg.auth_mode == "windows":
-        # Trusted Connection
         return base + "Trusted_Connection=yes;"
     else:
         if not cfg.username:
             raise ValueError("SQL username is blank.")
-        # Note: For ODBC Driver 18, encryption defaults may require extra params depending on your environment.
-        # If you run into SSL/Encrypt errors, we can add: Encrypt=yes;TrustServerCertificate=yes;
         return base + f"UID={cfg.username};PWD={cfg.password};"
 
 
@@ -108,19 +99,20 @@ def test_connection(cfg: AppConfig) -> tuple[bool, str]:
         return False, f"Connection failed:\n{e}"
 
 
-def fetch_shortsheets(conn, report_date: date) -> pd.DataFrame:
-    # Uses your earlier logic:
-    # - Orders for day from GP_SalesOrder.TxnDate
-    # - Shipped: aggregate by ProductNumber
-    # - Wip: available cases by plu for those SOs
-    #
-    # NOTE: If Wip rows are not 1 row per case, we can change COUNT(*) to SUM(field).
-    sql = """
+def fetch_shortsheets(conn, report_date: date, date_field: str = "TxnDate", only_remaining: bool = True) -> pd.DataFrame:
+    allowed = {"TxnDate", "ShipDate", "DueDate", "TimeCreated"}
+    if date_field not in allowed:
+        raise ValueError(f"Invalid date_field '{date_field}'. Must be one of: {sorted(allowed)}")
+
+    date_col = f"so.{date_field}"
+    where_remaining = "WHERE (sa.QtyOrdered - sa.QtyShipped) > 0" if only_remaining else ""
+
+    sql = f"""
     WITH OrdersForDay AS (
         SELECT so.TxnID
         FROM WPL.dbo.GP_SalesOrder AS so
-        WHERE so.TxnDate >= CAST(? AS datetime2(0))
-          AND so.TxnDate <  DATEADD(day, 1, CAST(? AS datetime2(0)))
+        WHERE {date_col} >= CAST(? AS datetime2(0))
+          AND {date_col} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
     ),
     ShippedAgg AS (
         SELECT
@@ -151,13 +143,59 @@ def fetch_shortsheets(conn, report_date: date) -> pd.DataFrame:
     FROM ShippedAgg sa
     LEFT JOIN InvAgg ia
       ON ia.PLU = sa.PLU
-    WHERE (sa.QtyOrdered - sa.QtyShipped) > 0
+    {where_remaining}
     ORDER BY RemainingCases DESC, sa.PLU;
     """
-    # Parameterize date safely
+
     params = (report_date.isoformat(), report_date.isoformat())
-    df = pd.read_sql(sql, conn, params=params)
-    return df
+    return pd.read_sql(sql, conn, params=params)
+
+
+def run_diagnostics(conn, report_date: date, date_field: str = "TxnDate") -> dict:
+    allowed = {"TxnDate", "ShipDate", "DueDate", "TimeCreated"}
+    if date_field not in allowed:
+        raise ValueError(f"Invalid date_field '{date_field}'. Must be one of: {sorted(allowed)}")
+
+    date_col = f"so.{date_field}"
+    params = (report_date.isoformat(), report_date.isoformat())
+
+    counts_sql = f"""
+    WITH OrdersForDay AS (
+        SELECT so.TxnID
+        FROM WPL.dbo.GP_SalesOrder AS so
+        WHERE {date_col} >= CAST(? AS datetime2(0))
+          AND {date_col} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
+    )
+    SELECT
+        (SELECT COUNT(*) FROM OrdersForDay) AS SO_Count,
+        (SELECT COUNT(*) FROM WPL.dbo.Shipped s JOIN OrdersForDay o ON o.TxnID = s.OrderNum) AS ShippedJoin_Count,
+        (SELECT COUNT(*) FROM WPL.dbo.Wip w JOIN OrdersForDay o ON o.TxnID = w.SO
+            WHERE w.status IN ('Available','ScanningSalesOrder','WaitingToBeInvoiced')) AS WipJoin_Count;
+    """
+    counts = pd.read_sql(counts_sql, conn, params=params).iloc[0].to_dict()
+
+    so_sample_sql = f"""
+    SELECT TOP 10 so.TxnID AS Sample_TxnID, so.{date_field} AS DateValue
+    FROM WPL.dbo.GP_SalesOrder so
+    WHERE {date_col} >= CAST(? AS datetime2(0))
+      AND {date_col} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
+    ORDER BY so.TxnID;
+    """
+    so_sample = pd.read_sql(so_sample_sql, conn, params=params)
+
+    shipped_sample_sql = """
+    SELECT TOP 10
+        s.OrderNum AS Sample_OrderNum,
+        s.ProductNumber AS Sample_PLU,
+        s.QtyOrdered AS Sample_QtyOrdered,
+        s.QtyShipped AS Sample_QtyShipped,
+        s.DateTimeStamp
+    FROM WPL.dbo.Shipped s
+    ORDER BY s.DateTimeStamp DESC;
+    """
+    shipped_sample = pd.read_sql(shipped_sample_sql, conn)
+
+    return {"counts": counts, "so_sample": so_sample, "shipped_sample": shipped_sample}
 
 
 # -----------------------------
@@ -166,37 +204,25 @@ def fetch_shortsheets(conn, report_date: date) -> pd.DataFrame:
 def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Product Excel not found: {path}")
-
-    # Let pandas choose engine; openpyxl is common
     if sheet_name.strip():
         df = pd.read_excel(path, sheet_name=sheet_name.strip())
     else:
         df = pd.read_excel(path)
-
-    # Normalize column names
     df.columns = [str(c).strip() for c in df.columns]
-
     return df
 
 
 def infer_product_columns(df: pd.DataFrame) -> dict:
-    """
-    Try to guess likely columns.
-    You can hard-map later once you confirm your master file columns.
-    """
     cols = {c.lower(): c for c in df.columns}
-
-    # Common candidates
     plu_candidates = ["plu", "productnumber", "product_number", "code", "item", "itemnumber"]
-    desc_candidates = ["description", "product description", "productdescription", "desc", "itemref_fullname", "name"]
-    tpc_candidates = ["trays per case", "trayspercase", "trays_case", "trays/case", "tpc"]
+    desc_candidates = ["description", "product description", "productdescription", "desc", "name"]
+    tpc_candidates = ["trays per case", "trayspercase", "trays/case", "tpc"]
     tpm_candidates = ["standard trays per minute", "stdtpm", "tpm", "trays per minute", "std trays per minute"]
 
     def find_any(cands):
         for k in cands:
             if k in cols:
                 return cols[k]
-        # also try contains match
         for c in df.columns:
             cl = c.lower()
             for k in cands:
@@ -214,14 +240,12 @@ def infer_product_columns(df: pd.DataFrame) -> dict:
 
 def merge_with_master(short_df: pd.DataFrame, master_df: pd.DataFrame) -> pd.DataFrame:
     colmap = infer_product_columns(master_df)
-
     if not colmap["plu"]:
         raise ValueError(
             "Couldn't detect the PLU column in your Product Excel.\n"
-            "Make sure your product file has a column named like: PLU, ProductNumber, ItemNumber, etc."
+            "Make sure your product file has a column like: PLU, ProductNumber, ItemNumber, etc."
         )
 
-    # Prepare PLU keys as strings for safe join
     s = short_df.copy()
     m = master_df.copy()
 
@@ -246,7 +270,6 @@ def merge_with_master(short_df: pd.DataFrame, master_df: pd.DataFrame) -> pd.Dat
         suffixes=("", "_master"),
     )
 
-    # Rename master columns to desired output headers
     rename_map = {}
     if colmap["description"]:
         rename_map[colmap["description"]] = "ProductDescription"
@@ -257,21 +280,24 @@ def merge_with_master(short_df: pd.DataFrame, master_df: pd.DataFrame) -> pd.Dat
 
     merged = merged.rename(columns=rename_map)
 
-    # Remove duplicate PLU column from master
     if colmap["plu"] in merged.columns:
         merged = merged.drop(columns=[colmap["plu"]])
 
-    # Arrange columns
-    desired = ["PLU", "ProductDescription", "TraysPerCase", "StdTraysPerMin",
-               "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
+    desired = [
+        "PLU",
+        "ProductDescription",
+        "TraysPerCase",
+        "StdTraysPerMin",
+        "QtyOrdered",
+        "QtyShipped",
+        "AvailableCases",
+        "RemainingCases",
+    ]
     cols = [c for c in desired if c in merged.columns] + [c for c in merged.columns if c not in desired]
-    merged = merged[cols]
-
-    return merged
+    return merged[cols]
 
 
 def export_to_excel(df: pd.DataFrame, out_path: str) -> None:
-    # Using openpyxl via pandas ExcelWriter
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Shortsheet", index=False)
 
@@ -283,7 +309,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("860x560")
+        self.geometry("920x620")
 
         self.cfg = load_config()
 
@@ -297,13 +323,15 @@ class App(tk.Tk):
         self.var_product_path = tk.StringVar(value=self.cfg.product_excel_path)
         self.var_product_sheet = tk.StringVar(value=self.cfg.product_sheet_name)
 
-        today = date.today().isoformat()
-        self.var_report_date = tk.StringVar(value=today)
+        self.var_report_date = tk.StringVar(value=date.today().isoformat())
+        self.var_date_field = tk.StringVar(value="TxnDate")
+        self.var_only_remaining = tk.BooleanVar(value=True)
 
         self.var_output_folder = tk.StringVar(value=self.cfg.output_folder or os.getcwd())
 
         self._build_ui()
         self._refresh_auth_state()
+        self._log("Ready.")
 
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
@@ -342,11 +370,8 @@ class App(tk.Tk):
         self.ent_pass.grid(row=row, column=3, sticky="w", **pad)
 
         row += 1
-        btn_test = ttk.Button(frm_conn, text="Test Connection", command=self.on_test_connection)
-        btn_test.grid(row=row, column=0, sticky="w", **pad)
-
-        btn_save = ttk.Button(frm_conn, text="Save Settings", command=self.on_save_settings)
-        btn_save.grid(row=row, column=1, sticky="w", **pad)
+        ttk.Button(frm_conn, text="Test Connection", command=self.on_test_connection).grid(row=row, column=0, sticky="w", **pad)
+        ttk.Button(frm_conn, text="Save Settings", command=self.on_save_settings).grid(row=row, column=1, sticky="w", **pad)
 
         # Product master frame
         frm_prod = ttk.LabelFrame(self, text="Product Master Excel (PLU database)")
@@ -354,7 +379,7 @@ class App(tk.Tk):
 
         row = 0
         ttk.Label(frm_prod, text="Excel File Path:").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_prod, textvariable=self.var_product_path, width=70).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Entry(frm_prod, textvariable=self.var_product_path, width=72).grid(row=row, column=1, sticky="w", **pad)
         ttk.Button(frm_prod, text="Browse...", command=self.on_browse_product).grid(row=row, column=2, sticky="w", **pad)
 
         row += 1
@@ -369,25 +394,30 @@ class App(tk.Tk):
         ttk.Label(frm_run, text="Sales Date (YYYY-MM-DD):").grid(row=row, column=0, sticky="w", **pad)
         ttk.Entry(frm_run, textvariable=self.var_report_date, width=18).grid(row=row, column=1, sticky="w", **pad)
 
-        ttk.Label(frm_run, text="Output Folder:").grid(row=row, column=2, sticky="w", **pad)
-        ttk.Entry(frm_run, textvariable=self.var_output_folder, width=30).grid(row=row, column=3, sticky="w", **pad)
-        ttk.Button(frm_run, text="Browse...", command=self.on_browse_output).grid(row=row, column=4, sticky="w", **pad)
+        ttk.Label(frm_run, text="Date Field:").grid(row=row, column=2, sticky="w", **pad)
+        ttk.Combobox(frm_run, textvariable=self.var_date_field,
+                     values=["TxnDate", "ShipDate", "DueDate", "TimeCreated"],
+                     state="readonly", width=16).grid(row=row, column=3, sticky="w", **pad)
+
+        ttk.Checkbutton(frm_run, text="Only Remaining (>0)", variable=self.var_only_remaining).grid(row=row, column=4, sticky="w", **pad)
 
         row += 1
-        ttk.Button(frm_run, text="Build Shortsheet", command=self.on_build_shortsheets).grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(frm_run, text="Output Folder:").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Entry(frm_run, textvariable=self.var_output_folder, width=45).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Button(frm_run, text="Browse...", command=self.on_browse_output).grid(row=row, column=2, sticky="w", **pad)
+
+        ttk.Button(frm_run, text="Build Shortsheet", command=self.on_build_shortsheets).grid(row=row, column=3, sticky="w", **pad)
+        ttk.Button(frm_run, text="Run Diagnostics", command=self.on_run_diagnostics).grid(row=row, column=4, sticky="w", **pad)
 
         # Log box
         frm_log = ttk.LabelFrame(self, text="Log")
         frm_log.pack(fill="both", expand=True, **pad)
 
-        self.txt_log = tk.Text(frm_log, height=12, wrap="word")
+        self.txt_log = tk.Text(frm_log, height=14, wrap="word")
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self._log("Ready.")
-
     def _refresh_auth_state(self):
-        mode = self.var_auth.get().strip().lower()
-        is_sql = mode == "sql"
+        is_sql = self.var_auth.get().strip().lower() == "sql"
         state = "normal" if is_sql else "disabled"
         self.ent_user.configure(state=state)
         self.ent_pass.configure(state=state)
@@ -418,10 +448,6 @@ class App(tk.Tk):
 
     def on_test_connection(self):
         cfg = self._collect_config()
-        if not cfg.server:
-            messagebox.showerror("Missing Server", "Please enter SQL Server address.")
-            return
-
         ok, msg = test_connection(cfg)
         self._log(msg)
         if ok:
@@ -442,19 +468,64 @@ class App(tk.Tk):
         if folder:
             self.var_output_folder.set(folder)
 
+    def _parse_report_date(self) -> date:
+        return datetime.strptime(self.var_report_date.get().strip(), "%Y-%m-%d").date()
+
+    def _connect(self, cfg: AppConfig):
+        cs = build_connection_string(cfg)
+        return pyodbc.connect(cs, timeout=15)
+
+    def on_run_diagnostics(self):
+        if pyodbc is None:
+            messagebox.showerror("Missing Dependency", "pyodbc is not installed. Run: pip install pyodbc")
+            return
+
+        cfg = self._collect_config()
+        try:
+            rpt = self._parse_report_date()
+        except ValueError:
+            messagebox.showerror("Invalid Date", "Enter date as YYYY-MM-DD (example: 2026-02-05).")
+            return
+
+        date_field = self.var_date_field.get().strip()
+
+        try:
+            self._log("Connecting to SQL Server for diagnostics...")
+            with self._connect(cfg) as conn:
+                diag = run_diagnostics(conn, rpt, date_field=date_field)
+
+            self._log(f"Diagnostics ({date_field}={rpt.isoformat()}):")
+            c = diag["counts"]
+            self._log(f"  SO_Count: {c.get('SO_Count')}")
+            self._log(f"  ShippedJoin_Count: {c.get('ShippedJoin_Count')}")
+            self._log(f"  WipJoin_Count: {c.get('WipJoin_Count')}")
+
+            self._log("  Sample SO TxnIDs:")
+            for _, row in diag["so_sample"].iterrows():
+                self._log(f"    {row['Sample_TxnID']}  |  {row['DateValue']}")
+
+            self._log("  Sample Shipped rows (latest):")
+            for _, row in diag["shipped_sample"].iterrows():
+                self._log(f"    OrderNum={row['Sample_OrderNum']}  PLU={row['Sample_PLU']}  "
+                          f"QtyOrdered={row['Sample_QtyOrdered']}  QtyShipped={row['Sample_QtyShipped']}  "
+                          f"DT={row['DateTimeStamp']}")
+
+            messagebox.showinfo("Diagnostics", "Diagnostics logged. Check the Log box.")
+        except Exception as e:
+            self._log("ERROR diagnostics:")
+            self._log(str(e))
+            self._log(traceback.format_exc())
+            messagebox.showerror("Diagnostics Error", str(e))
+
     def on_build_shortsheets(self):
         if pyodbc is None:
             messagebox.showerror("Missing Dependency", "pyodbc is not installed. Run: pip install pyodbc")
             return
 
         cfg = self._collect_config()
-        if not cfg.server:
-            messagebox.showerror("Missing Server", "Please enter SQL Server address.")
-            return
 
-        # Parse date
         try:
-            rpt = datetime.strptime(self.var_report_date.get().strip(), "%Y-%m-%d").date()
+            rpt = self._parse_report_date()
         except ValueError:
             messagebox.showerror("Invalid Date", "Enter date as YYYY-MM-DD (example: 2026-02-05).")
             return
@@ -469,13 +540,15 @@ class App(tk.Tk):
             messagebox.showerror("Product Master Error", str(e))
             return
 
-        # Connect and fetch
+        # Fetch shortsheet
+        date_field = self.var_date_field.get().strip()
+        only_remaining = bool(self.var_only_remaining.get())
+
         try:
-            cs = build_connection_string(cfg)
             self._log("Connecting to SQL Server...")
-            with pyodbc.connect(cs, timeout=15) as conn:
-                self._log(f"Fetching shortsheet data for {rpt.isoformat()} ...")
-                short_df = fetch_shortsheets(conn, rpt)
+            with self._connect(cfg) as conn:
+                self._log(f"Fetching shortsheet data for {rpt.isoformat()} (date field: {date_field}) ...")
+                short_df = fetch_shortsheets(conn, rpt, date_field=date_field, only_remaining=only_remaining)
             self._log(f"Shortsheet rows returned: {len(short_df):,}")
         except Exception as e:
             self._log("ERROR fetching from SQL:")
@@ -485,11 +558,11 @@ class App(tk.Tk):
             return
 
         if short_df.empty:
-            self._log("No remaining balances found (query returned 0 rows).")
-            messagebox.showinfo("No Results", "No remaining balances found for that date.")
+            self._log("No rows returned. Try: (1) change Date Field, (2) uncheck Only Remaining, (3) Run Diagnostics.")
+            messagebox.showinfo("No Results", "No rows returned. Try changing Date Field or unchecking Only Remaining. Then run Diagnostics.")
             return
 
-        # Merge
+        # Merge with master
         try:
             self._log("Merging with product master (by PLU)...")
             merged = merge_with_master(short_df, master_df)
