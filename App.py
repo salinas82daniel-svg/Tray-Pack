@@ -14,23 +14,23 @@ except ImportError:
     pyodbc = None
 
 
-APP_NAME = "SQL Shortsheet Builder"
+APP_NAME = "Shortsheet Builder (SO-tied Shipped)"
 CONFIG_FILE = "config.json"
 
 
 # -----------------------------
-# Config model
+# Config
 # -----------------------------
 @dataclass
 class AppConfig:
     server: str = ""
     database: str = "WPL"
     driver: str = ""
-    auth_mode: str = "windows"  # "windows" or "sql"
+    auth_mode: str = "windows"  # windows / sql
     username: str = ""
     password: str = ""
     product_excel_path: str = "Product Info.xlsx"
-    product_sheet_name: str = ""  # blank = first sheet
+    product_sheet_name: str = ""
     output_folder: str = ""
 
 
@@ -71,7 +71,7 @@ def list_odbc_drivers() -> list[str]:
 
 def build_connection_string(cfg: AppConfig) -> str:
     if not cfg.driver:
-        raise ValueError("ODBC Driver is blank. Select an installed SQL Server ODBC driver.")
+        raise ValueError("ODBC Driver is blank.")
     if not cfg.server:
         raise ValueError("Server Address is blank.")
 
@@ -99,125 +99,26 @@ def test_connection(cfg: AppConfig) -> tuple[bool, str]:
         return False, f"Connection failed:\n{e}"
 
 
-def fetch_shortsheets(conn, report_date: date, date_field: str = "TxnDate", only_remaining: bool = True) -> pd.DataFrame:
-    allowed = {"TxnDate", "ShipDate", "DueDate", "TimeCreated"}
-    if date_field not in allowed:
-        raise ValueError(f"Invalid date_field '{date_field}'. Must be one of: {sorted(allowed)}")
-
-    date_col = f"so.{date_field}"
-    where_remaining = "WHERE (sa.QtyOrdered - sa.QtyShipped) > 0" if only_remaining else ""
-
-    sql = f"""
-    WITH OrdersForDay AS (
-        SELECT so.TxnID
-        FROM WPL.dbo.GP_SalesOrder AS so
-        WHERE {date_col} >= CAST(? AS datetime2(0))
-          AND {date_col} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
-    ),
-    ShippedAgg AS (
-        SELECT
-            s.ProductNumber AS PLU,
-            SUM(COALESCE(s.QtyOrdered, 0)) AS QtyOrdered,
-            SUM(COALESCE(s.QtyShipped, 0)) AS QtyShipped
-        FROM WPL.dbo.Shipped AS s
-        JOIN OrdersForDay o
-          ON o.TxnID = s.OrderNum
-        GROUP BY s.ProductNumber
-    ),
-    InvAgg AS (
-        SELECT
-            w.plu AS PLU,
-            COUNT(*) AS AvailableCases
-        FROM WPL.dbo.Wip AS w
-        JOIN OrdersForDay o
-          ON o.TxnID = w.SO
-        WHERE w.status IN ('Available','ScanningSalesOrder','WaitingToBeInvoiced')
-        GROUP BY w.plu
-    )
-    SELECT
-        sa.PLU,
-        sa.QtyOrdered,
-        sa.QtyShipped,
-        COALESCE(ia.AvailableCases, 0) AS AvailableCases,
-        (sa.QtyOrdered - sa.QtyShipped) AS RemainingCases
-    FROM ShippedAgg sa
-    LEFT JOIN InvAgg ia
-      ON ia.PLU = sa.PLU
-    {where_remaining}
-    ORDER BY RemainingCases DESC, sa.PLU;
-    """
-
-    params = (report_date.isoformat(), report_date.isoformat())
-    return pd.read_sql(sql, conn, params=params)
-
-
-def run_diagnostics(conn, report_date: date, date_field: str = "TxnDate") -> dict:
-    allowed = {"TxnDate", "ShipDate", "DueDate", "TimeCreated"}
-    if date_field not in allowed:
-        raise ValueError(f"Invalid date_field '{date_field}'. Must be one of: {sorted(allowed)}")
-
-    date_col = f"so.{date_field}"
-    params = (report_date.isoformat(), report_date.isoformat())
-
-    counts_sql = f"""
-    WITH OrdersForDay AS (
-        SELECT so.TxnID
-        FROM WPL.dbo.GP_SalesOrder AS so
-        WHERE {date_col} >= CAST(? AS datetime2(0))
-          AND {date_col} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
-    )
-    SELECT
-        (SELECT COUNT(*) FROM OrdersForDay) AS SO_Count,
-        (SELECT COUNT(*) FROM WPL.dbo.Shipped s JOIN OrdersForDay o ON o.TxnID = s.OrderNum) AS ShippedJoin_Count,
-        (SELECT COUNT(*) FROM WPL.dbo.Wip w JOIN OrdersForDay o ON o.TxnID = w.SO
-            WHERE w.status IN ('Available','ScanningSalesOrder','WaitingToBeInvoiced')) AS WipJoin_Count;
-    """
-    counts = pd.read_sql(counts_sql, conn, params=params).iloc[0].to_dict()
-
-    so_sample_sql = f"""
-    SELECT TOP 10 so.TxnID AS Sample_TxnID, so.{date_field} AS DateValue
-    FROM WPL.dbo.GP_SalesOrder so
-    WHERE {date_col} >= CAST(? AS datetime2(0))
-      AND {date_col} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
-    ORDER BY so.TxnID;
-    """
-    so_sample = pd.read_sql(so_sample_sql, conn, params=params)
-
-    shipped_sample_sql = """
-    SELECT TOP 10
-        s.OrderNum AS Sample_OrderNum,
-        s.ProductNumber AS Sample_PLU,
-        s.QtyOrdered AS Sample_QtyOrdered,
-        s.QtyShipped AS Sample_QtyShipped,
-        s.DateTimeStamp
-    FROM WPL.dbo.Shipped s
-    ORDER BY s.DateTimeStamp DESC;
-    """
-    shipped_sample = pd.read_sql(shipped_sample_sql, conn)
-
-    return {"counts": counts, "so_sample": so_sample, "shipped_sample": shipped_sample}
-
-
 # -----------------------------
 # Product master helpers
 # -----------------------------
 def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Product Excel not found: {path}")
+    if not path or not os.path.exists(path):
+        return pd.DataFrame()
+
     if sheet_name.strip():
         df = pd.read_excel(path, sheet_name=sheet_name.strip())
     else:
         df = pd.read_excel(path)
+
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def infer_product_columns(df: pd.DataFrame) -> dict:
+def infer_master_cols(df: pd.DataFrame) -> dict:
     cols = {c.lower(): c for c in df.columns}
-    plu_candidates = ["plu", "productnumber", "product_number", "code", "item", "itemnumber"]
-    desc_candidates = ["description", "product description", "productdescription", "desc", "name"]
-    tpc_candidates = ["trays per case", "trayspercase", "trays/case", "tpc"]
-    tpm_candidates = ["standard trays per minute", "stdtpm", "tpm", "trays per minute", "std trays per minute"]
+    plu_candidates = ["plu", "productnumber", "product_number", "itemnumber", "item_number", "code"]
+    desc_candidates = ["product description", "productdescription", "description", "desc", "name"]
 
     def find_any(cands):
         for k in cands:
@@ -230,71 +131,138 @@ def infer_product_columns(df: pd.DataFrame) -> dict:
                     return c
         return ""
 
-    return {
-        "plu": find_any(plu_candidates),
-        "description": find_any(desc_candidates),
-        "trays_per_case": find_any(tpc_candidates),
-        "std_tpm": find_any(tpm_candidates),
-    }
+    return {"plu": find_any(plu_candidates), "desc": find_any(desc_candidates)}
 
 
-def merge_with_master(short_df: pd.DataFrame, master_df: pd.DataFrame) -> pd.DataFrame:
-    colmap = infer_product_columns(master_df)
+def merge_description(short_df: pd.DataFrame, master_df: pd.DataFrame) -> pd.DataFrame:
+    if master_df.empty:
+        return short_df
+
+    colmap = infer_master_cols(master_df)
     if not colmap["plu"]:
-        raise ValueError(
-            "Couldn't detect the PLU column in your Product Excel.\n"
-            "Make sure your product file has a column like: PLU, ProductNumber, ItemNumber, etc."
-        )
+        return short_df
 
-    s = short_df.copy()
     m = master_df.copy()
+    m[colmap["plu"]] = m[colmap["plu"]].astype(str).str.strip().str.zfill(5)
 
-    s["PLU"] = s["PLU"].astype(str).str.strip()
-    m[colmap["plu"]] = m[colmap["plu"]].astype(str).str.strip()
+    keep = [colmap["plu"]]
+    if colmap["desc"]:
+        keep.append(colmap["desc"])
 
-    keep_cols = [colmap["plu"]]
-    if colmap["description"]:
-        keep_cols.append(colmap["description"])
-    if colmap["trays_per_case"]:
-        keep_cols.append(colmap["trays_per_case"])
-    if colmap["std_tpm"]:
-        keep_cols.append(colmap["std_tpm"])
+    m2 = m[keep].drop_duplicates(subset=[colmap["plu"]])
 
-    m2 = m[keep_cols].drop_duplicates(subset=[colmap["plu"]])
+    out = short_df.copy()
+    out["PLU"] = out["PLU"].astype(str).str.strip().str.zfill(5)
 
-    merged = s.merge(
-        m2,
-        how="left",
-        left_on="PLU",
-        right_on=colmap["plu"],
-        suffixes=("", "_master"),
-    )
-
-    rename_map = {}
-    if colmap["description"]:
-        rename_map[colmap["description"]] = "ProductDescription"
-    if colmap["trays_per_case"]:
-        rename_map[colmap["trays_per_case"]] = "TraysPerCase"
-    if colmap["std_tpm"]:
-        rename_map[colmap["std_tpm"]] = "StdTraysPerMin"
-
-    merged = merged.rename(columns=rename_map)
-
+    merged = out.merge(m2, how="left", left_on="PLU", right_on=colmap["plu"])
     if colmap["plu"] in merged.columns:
         merged = merged.drop(columns=[colmap["plu"]])
+    if colmap["desc"] and colmap["desc"] in merged.columns:
+        merged = merged.rename(columns={colmap["desc"]: "ProductDescription"})
 
-    desired = [
-        "PLU",
-        "ProductDescription",
-        "TraysPerCase",
-        "StdTraysPerMin",
-        "QtyOrdered",
-        "QtyShipped",
-        "AvailableCases",
-        "RemainingCases",
-    ]
+    desired = ["PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
     cols = [c for c in desired if c in merged.columns] + [c for c in merged.columns if c not in desired]
     return merged[cols]
+
+
+# -----------------------------
+# Core query (SO-tied shipped)
+# -----------------------------
+def fetch_shortsheets(
+    conn,
+    schedule_date: date,
+    so_date_field: str,
+    include_available_statuses: list[str],
+    only_remaining: bool = True
+) -> pd.DataFrame:
+    """
+    Builds shortsheet by PLU for SOs in a schedule day:
+      - Ordered from SO_Detail (Quantity) by PLU (ItemRef_FullName like '00269')
+      - Shipped from Shipped (QtyShipped) ONLY for those SOs (OrderNum in OrdersForDay)
+      - Available from Wip filtered to PLUs on those orders, using selected statuses
+      - Remaining = Ordered - Shipped
+    """
+
+    allowed_fields = {"TxnDate", "ShipDate", "DueDate", "TimeCreated"}
+    if so_date_field not in allowed_fields:
+        raise ValueError(f"Invalid SO date field: {so_date_field}")
+
+    # Build safe IN (...) list for statuses
+    statuses = [s.strip() for s in include_available_statuses if s.strip()]
+    if not statuses:
+        statuses = ["Available"]
+
+    # NOTE: status literals are safe since we control list, but still escape single quotes just in case
+    status_sql = ", ".join([f"'{s.replace(\"'\", \"''\")}'" for s in statuses])
+
+    where_remaining = "WHERE (o.QtyOrdered - COALESCE(s.QtyShipped,0)) > 0" if only_remaining else ""
+
+    date_col = f"so.{so_date_field}"
+
+    sql = f"""
+    WITH OrdersForDay AS (
+        SELECT so.TxnID
+        FROM WPL.dbo.GP_SalesOrder so
+        WHERE {date_col} >= CAST(? AS datetime2(0))
+          AND {date_col} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
+    ),
+    OrderedAgg AS (
+        SELECT
+            TRY_CONVERT(int, d.ItemRef_FullName) AS PLU_Int,
+            SUM(COALESCE(d.Quantity, 0)) AS QtyOrdered
+        FROM WPL.dbo.GP_SalesOrderLineDetail d
+        JOIN OrdersForDay o
+          ON o.TxnID = d.TxnIDKey
+        WHERE TRY_CONVERT(int, d.ItemRef_FullName) IS NOT NULL
+        GROUP BY TRY_CONVERT(int, d.ItemRef_FullName)
+    ),
+    ShippedAgg AS (
+        SELECT
+            TRY_CONVERT(int, s.ProductNumber) AS PLU_Int,
+            SUM(COALESCE(s.QtyShipped, 0)) AS QtyShipped
+        FROM WPL.dbo.Shipped s
+        JOIN OrdersForDay o
+          ON o.TxnID = s.OrderNum
+        WHERE TRY_CONVERT(int, s.ProductNumber) IS NOT NULL
+        GROUP BY TRY_CONVERT(int, s.ProductNumber)
+    ),
+    InvAgg AS (
+        SELECT
+            TRY_CONVERT(int, w.plu) AS PLU_Int,
+            COUNT(*) AS AvailableCases
+        FROM WPL.dbo.Wip w
+        -- Only pull WIP for PLUs that are on today's orders (keeps it light)
+        JOIN OrderedAgg oa
+          ON oa.PLU_Int = TRY_CONVERT(int, w.plu)
+        WHERE w.status IN ({status_sql})
+          AND TRY_CONVERT(int, w.plu) IS NOT NULL
+        GROUP BY TRY_CONVERT(int, w.plu)
+    )
+    SELECT
+        oa.PLU_Int,
+        oa.QtyOrdered,
+        COALESCE(s.QtyShipped, 0) AS QtyShipped,
+        COALESCE(i.AvailableCases, 0) AS AvailableCases,
+        (oa.QtyOrdered - COALESCE(s.QtyShipped, 0)) AS RemainingCases
+    FROM OrderedAgg oa
+    LEFT JOIN ShippedAgg s
+      ON s.PLU_Int = oa.PLU_Int
+    LEFT JOIN InvAgg i
+      ON i.PLU_Int = oa.PLU_Int
+    {where_remaining}
+    ORDER BY RemainingCases DESC, oa.PLU_Int;
+    """
+
+    params = (schedule_date.isoformat(), schedule_date.isoformat())
+    df = pd.read_sql(sql, conn, params=params)
+
+    if df.empty:
+        return df
+
+    # Format PLU as 5 digits like '00269'
+    df["PLU"] = df["PLU_Int"].astype(int).astype(str).str.zfill(5)
+    df = df.drop(columns=["PLU_Int"])
+    return df
 
 
 def export_to_excel(df: pd.DataFrame, out_path: str) -> None:
@@ -309,23 +277,31 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("920x620")
+        self.geometry("980x680")
 
         self.cfg = load_config()
 
-        # Variables
+        # connection vars
         self.var_server = tk.StringVar(value=self.cfg.server)
         self.var_database = tk.StringVar(value=self.cfg.database)
         self.var_driver = tk.StringVar(value=self.cfg.driver)
         self.var_auth = tk.StringVar(value=self.cfg.auth_mode)
         self.var_user = tk.StringVar(value=self.cfg.username)
         self.var_pass = tk.StringVar(value=self.cfg.password)
+
+        # product excel vars
         self.var_product_path = tk.StringVar(value=self.cfg.product_excel_path)
         self.var_product_sheet = tk.StringVar(value=self.cfg.product_sheet_name)
 
-        self.var_report_date = tk.StringVar(value=date.today().isoformat())
-        self.var_date_field = tk.StringVar(value="TxnDate")
+        # run vars
+        self.var_schedule_date = tk.StringVar(value=date.today().isoformat())
+        self.var_so_date_field = tk.StringVar(value="ShipDate")  # default because that's typically the "schedule"
         self.var_only_remaining = tk.BooleanVar(value=True)
+
+        # WIP statuses for AvailableCases (configurable)
+        self.var_wip_available = tk.BooleanVar(value=True)
+        self.var_wip_scanning = tk.BooleanVar(value=True)
+        self.var_wip_waiting = tk.BooleanVar(value=True)
 
         self.var_output_folder = tk.StringVar(value=self.cfg.output_folder or os.getcwd())
 
@@ -336,7 +312,6 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
-        # Connection frame
         frm_conn = ttk.LabelFrame(self, text="SQL Connection")
         frm_conn.pack(fill="x", **pad)
 
@@ -350,15 +325,14 @@ class App(tk.Tk):
         row += 1
         ttk.Label(frm_conn, text="ODBC Driver:").grid(row=row, column=0, sticky="w", **pad)
         drivers = list_odbc_drivers()
-        self.cmb_driver = ttk.Combobox(frm_conn, textvariable=self.var_driver, values=drivers, width=42)
-        self.cmb_driver.grid(row=row, column=1, sticky="w", **pad)
+        ttk.Combobox(frm_conn, textvariable=self.var_driver, values=drivers, width=42).grid(row=row, column=1, sticky="w", **pad)
         if drivers and not self.var_driver.get():
             self.var_driver.set(drivers[0])
 
         ttk.Label(frm_conn, text="Auth Mode:").grid(row=row, column=2, sticky="w", **pad)
-        self.cmb_auth = ttk.Combobox(frm_conn, textvariable=self.var_auth, values=["windows", "sql"], width=15, state="readonly")
-        self.cmb_auth.grid(row=row, column=3, sticky="w", **pad)
-        self.cmb_auth.bind("<<ComboboxSelected>>", lambda e: self._refresh_auth_state())
+        cmb_auth = ttk.Combobox(frm_conn, textvariable=self.var_auth, values=["windows", "sql"], width=15, state="readonly")
+        cmb_auth.grid(row=row, column=3, sticky="w", **pad)
+        cmb_auth.bind("<<ComboboxSelected>>", lambda e: self._refresh_auth_state())
 
         row += 1
         ttk.Label(frm_conn, text="Username:").grid(row=row, column=0, sticky="w", **pad)
@@ -373,47 +347,49 @@ class App(tk.Tk):
         ttk.Button(frm_conn, text="Test Connection", command=self.on_test_connection).grid(row=row, column=0, sticky="w", **pad)
         ttk.Button(frm_conn, text="Save Settings", command=self.on_save_settings).grid(row=row, column=1, sticky="w", **pad)
 
-        # Product master frame
-        frm_prod = ttk.LabelFrame(self, text="Product Master Excel (PLU database)")
+        frm_prod = ttk.LabelFrame(self, text="Product Master Excel (optional: add description)")
         frm_prod.pack(fill="x", **pad)
 
         row = 0
         ttk.Label(frm_prod, text="Excel File Path:").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_prod, textvariable=self.var_product_path, width=72).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Entry(frm_prod, textvariable=self.var_product_path, width=74).grid(row=row, column=1, sticky="w", **pad)
         ttk.Button(frm_prod, text="Browse...", command=self.on_browse_product).grid(row=row, column=2, sticky="w", **pad)
 
         row += 1
         ttk.Label(frm_prod, text="Sheet Name (optional):").grid(row=row, column=0, sticky="w", **pad)
         ttk.Entry(frm_prod, textvariable=self.var_product_sheet, width=30).grid(row=row, column=1, sticky="w", **pad)
 
-        # Run frame
         frm_run = ttk.LabelFrame(self, text="Shortsheet Run")
         frm_run.pack(fill="x", **pad)
 
         row = 0
-        ttk.Label(frm_run, text="Sales Date (YYYY-MM-DD):").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_run, textvariable=self.var_report_date, width=18).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Label(frm_run, text="Schedule Date (YYYY-MM-DD):").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Entry(frm_run, textvariable=self.var_schedule_date, width=18).grid(row=row, column=1, sticky="w", **pad)
 
-        ttk.Label(frm_run, text="Date Field:").grid(row=row, column=2, sticky="w", **pad)
-        ttk.Combobox(frm_run, textvariable=self.var_date_field,
+        ttk.Label(frm_run, text="SO Date Field:").grid(row=row, column=2, sticky="w", **pad)
+        ttk.Combobox(frm_run, textvariable=self.var_so_date_field,
                      values=["TxnDate", "ShipDate", "DueDate", "TimeCreated"],
                      state="readonly", width=16).grid(row=row, column=3, sticky="w", **pad)
 
         ttk.Checkbutton(frm_run, text="Only Remaining (>0)", variable=self.var_only_remaining).grid(row=row, column=4, sticky="w", **pad)
 
         row += 1
+        ttk.Label(frm_run, text="WIP statuses to count as Available:").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Checkbutton(frm_run, text="Available", variable=self.var_wip_available).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Checkbutton(frm_run, text="ScanningSalesOrder", variable=self.var_wip_scanning).grid(row=row, column=2, sticky="w", **pad)
+        ttk.Checkbutton(frm_run, text="WaitingToBeInvoiced", variable=self.var_wip_waiting).grid(row=row, column=3, sticky="w", **pad)
+
+        row += 1
         ttk.Label(frm_run, text="Output Folder:").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_run, textvariable=self.var_output_folder, width=45).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Entry(frm_run, textvariable=self.var_output_folder, width=50).grid(row=row, column=1, sticky="w", **pad)
         ttk.Button(frm_run, text="Browse...", command=self.on_browse_output).grid(row=row, column=2, sticky="w", **pad)
 
-        ttk.Button(frm_run, text="Build Shortsheet", command=self.on_build_shortsheets).grid(row=row, column=3, sticky="w", **pad)
-        ttk.Button(frm_run, text="Run Diagnostics", command=self.on_run_diagnostics).grid(row=row, column=4, sticky="w", **pad)
+        ttk.Button(frm_run, text="Build Shortsheet", command=self.on_build).grid(row=row, column=3, sticky="w", **pad)
 
-        # Log box
         frm_log = ttk.LabelFrame(self, text="Log")
         frm_log.pack(fill="both", expand=True, **pad)
 
-        self.txt_log = tk.Text(frm_log, height=14, wrap="word")
+        self.txt_log = tk.Text(frm_log, height=16, wrap="word")
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=10)
 
     def _refresh_auth_state(self):
@@ -440,6 +416,12 @@ class App(tk.Tk):
         self.txt_log.insert("end", f"[{ts}] {msg}\n")
         self.txt_log.see("end")
         self.update_idletasks()
+
+    def _parse_date(self, s: str) -> date:
+        return datetime.strptime(s.strip(), "%Y-%m-%d").date()
+
+    def _connect(self, cfg: AppConfig):
+        return pyodbc.connect(build_connection_string(cfg), timeout=20)
 
     def on_save_settings(self):
         self.cfg = self._collect_config()
@@ -468,56 +450,7 @@ class App(tk.Tk):
         if folder:
             self.var_output_folder.set(folder)
 
-    def _parse_report_date(self) -> date:
-        return datetime.strptime(self.var_report_date.get().strip(), "%Y-%m-%d").date()
-
-    def _connect(self, cfg: AppConfig):
-        cs = build_connection_string(cfg)
-        return pyodbc.connect(cs, timeout=15)
-
-    def on_run_diagnostics(self):
-        if pyodbc is None:
-            messagebox.showerror("Missing Dependency", "pyodbc is not installed. Run: pip install pyodbc")
-            return
-
-        cfg = self._collect_config()
-        try:
-            rpt = self._parse_report_date()
-        except ValueError:
-            messagebox.showerror("Invalid Date", "Enter date as YYYY-MM-DD (example: 2026-02-05).")
-            return
-
-        date_field = self.var_date_field.get().strip()
-
-        try:
-            self._log("Connecting to SQL Server for diagnostics...")
-            with self._connect(cfg) as conn:
-                diag = run_diagnostics(conn, rpt, date_field=date_field)
-
-            self._log(f"Diagnostics ({date_field}={rpt.isoformat()}):")
-            c = diag["counts"]
-            self._log(f"  SO_Count: {c.get('SO_Count')}")
-            self._log(f"  ShippedJoin_Count: {c.get('ShippedJoin_Count')}")
-            self._log(f"  WipJoin_Count: {c.get('WipJoin_Count')}")
-
-            self._log("  Sample SO TxnIDs:")
-            for _, row in diag["so_sample"].iterrows():
-                self._log(f"    {row['Sample_TxnID']}  |  {row['DateValue']}")
-
-            self._log("  Sample Shipped rows (latest):")
-            for _, row in diag["shipped_sample"].iterrows():
-                self._log(f"    OrderNum={row['Sample_OrderNum']}  PLU={row['Sample_PLU']}  "
-                          f"QtyOrdered={row['Sample_QtyOrdered']}  QtyShipped={row['Sample_QtyShipped']}  "
-                          f"DT={row['DateTimeStamp']}")
-
-            messagebox.showinfo("Diagnostics", "Diagnostics logged. Check the Log box.")
-        except Exception as e:
-            self._log("ERROR diagnostics:")
-            self._log(str(e))
-            self._log(traceback.format_exc())
-            messagebox.showerror("Diagnostics Error", str(e))
-
-    def on_build_shortsheets(self):
+    def on_build(self):
         if pyodbc is None:
             messagebox.showerror("Missing Dependency", "pyodbc is not installed. Run: pip install pyodbc")
             return
@@ -525,60 +458,66 @@ class App(tk.Tk):
         cfg = self._collect_config()
 
         try:
-            rpt = self._parse_report_date()
+            sched = self._parse_date(self.var_schedule_date.get())
         except ValueError:
-            messagebox.showerror("Invalid Date", "Enter date as YYYY-MM-DD (example: 2026-02-05).")
+            messagebox.showerror("Invalid Date", "Enter date as YYYY-MM-DD (example: 2026-02-06).")
             return
 
-        # Load product master
-        try:
-            self._log(f"Loading product master: {cfg.product_excel_path}")
-            master_df = load_product_master(cfg.product_excel_path, cfg.product_sheet_name)
-            self._log(f"Loaded product master rows: {len(master_df):,}")
-        except Exception as e:
-            self._log(f"ERROR loading product master: {e}")
-            messagebox.showerror("Product Master Error", str(e))
-            return
+        statuses = []
+        if self.var_wip_available.get():
+            statuses.append("Available")
+        if self.var_wip_scanning.get():
+            statuses.append("ScanningSalesOrder")
+        if self.var_wip_waiting.get():
+            statuses.append("WaitingToBeInvoiced")
 
-        # Fetch shortsheet
-        date_field = self.var_date_field.get().strip()
         only_remaining = bool(self.var_only_remaining.get())
+        so_field = self.var_so_date_field.get().strip()
+
+        # Load master (optional)
+        master_df = load_product_master(cfg.product_excel_path, cfg.product_sheet_name)
+        if not master_df.empty:
+            self._log(f"Loaded product master rows: {len(master_df):,}")
+        else:
+            self._log("No product master loaded (descriptions will be blank).")
 
         try:
             self._log("Connecting to SQL Server...")
             with self._connect(cfg) as conn:
-                self._log(f"Fetching shortsheet data for {rpt.isoformat()} (date field: {date_field}) ...")
-                short_df = fetch_shortsheets(conn, rpt, date_field=date_field, only_remaining=only_remaining)
-            self._log(f"Shortsheet rows returned: {len(short_df):,}")
+                self._log(f"Running shortsheet for {sched.isoformat()} using SO.{so_field} ...")
+                df = fetch_shortsheets(
+                    conn,
+                    schedule_date=sched,
+                    so_date_field=so_field,
+                    include_available_statuses=statuses,
+                    only_remaining=only_remaining
+                )
+            self._log(f"Rows returned: {len(df):,}")
         except Exception as e:
-            self._log("ERROR fetching from SQL:")
+            self._log("ERROR running query:")
             self._log(str(e))
             self._log(traceback.format_exc())
             messagebox.showerror("SQL Error", str(e))
             return
 
-        if short_df.empty:
-            self._log("No rows returned. Try: (1) change Date Field, (2) uncheck Only Remaining, (3) Run Diagnostics.")
-            messagebox.showinfo("No Results", "No rows returned. Try changing Date Field or unchecking Only Remaining. Then run Diagnostics.")
+        if df.empty:
+            self._log("No rows returned. Try changing SO Date Field (TxnDate vs ShipDate).")
+            messagebox.showinfo("No Results", "No rows returned. Try changing the SO Date Field.")
             return
 
-        # Merge with master
+        # Merge description (optional)
         try:
-            self._log("Merging with product master (by PLU)...")
-            merged = merge_with_master(short_df, master_df)
-            self._log("Merge complete.")
+            df = merge_description(df, master_df) if not master_df.empty else df
         except Exception as e:
-            self._log(f"ERROR merging: {e}")
-            messagebox.showerror("Merge Error", str(e))
-            return
+            self._log(f"WARNING: description merge failed: {e}")
 
         # Export
         try:
             out_folder = cfg.output_folder or os.getcwd()
             os.makedirs(out_folder, exist_ok=True)
-            out_path = os.path.join(out_folder, f"Shortsheet_{rpt.isoformat()}.xlsx")
-            self._log(f"Exporting to: {out_path}")
-            export_to_excel(merged, out_path)
+            out_path = os.path.join(out_folder, f"Shortsheet_{so_field}_{sched.isoformat()}.xlsx")
+            self._log(f"Exporting: {out_path}")
+            export_to_excel(df, out_path)
             self._log("Export complete.")
             messagebox.showinfo("Done", f"Shortsheet created:\n{out_path}")
         except Exception as e:
@@ -587,8 +526,7 @@ class App(tk.Tk):
 
 
 def main():
-    app = App()
-    app.mainloop()
+    App().mainloop()
 
 
 if __name__ == "__main__":
