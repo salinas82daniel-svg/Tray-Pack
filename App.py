@@ -2,7 +2,7 @@ import json
 import os
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, time, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -14,7 +14,7 @@ except ImportError:
     pyodbc = None
 
 
-APP_NAME = "Shortsheet Builder (TxnDate)"
+APP_NAME = "Shortsheet + Production Builder"
 CONFIG_FILE = "config.json"
 
 
@@ -113,118 +113,61 @@ def _build_in_list_sql(values: list[str]) -> str:
 
 
 def sql_int_expr(col_name: str) -> str:
-    """Old-SQL-safe: returns INT or NULL (no TRY_CONVERT)."""
+    """Old-SQL-safe: returns INT or NULL."""
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS INT) ELSE NULL END)"
 
 
 def sql_num_expr(col_name: str) -> str:
-    """Old-SQL-safe: returns FLOAT numeric or 0 (handles nchar/varchar quantities)."""
+    """Old-SQL-safe: returns FLOAT or 0."""
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS FLOAT) ELSE 0 END)"
 
 
+def safe_float(x) -> float:
+    try:
+        if pd.isna(x):
+            return 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
+
 # -----------------------------
-# Queries (TxnDate only)
+# Product master
 # -----------------------------
-def run_diagnostics(conn, schedule_date: date, statuses: list[str]) -> dict:
-    status_sql = _build_in_list_sql(statuses if statuses else ["Available"])
+def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
+    if not path or not os.path.exists(path):
+        return pd.DataFrame()
 
-    d_plu = sql_int_expr("d.ItemRef_FullName")
-    s_plu = sql_int_expr("s.ProductNumber")
-    w_plu = sql_int_expr("w.plu")
+    if sheet_name.strip():
+        df = pd.read_excel(path, sheet_name=sheet_name.strip())
+    else:
+        df = pd.read_excel(path)
 
-    d_qty = sql_num_expr("d.Quantity")
-    s_qty = sql_num_expr("s.QtyShipped")
+    df.columns = [str(c).strip() for c in df.columns]
 
-    sql_counts = f"""
-    WITH OrdersForDay AS (
-        SELECT so.TxnID
-        FROM WPL.dbo.GP_SalesOrder so
-        WHERE so.TxnDate >= CAST(? AS DATETIME)
-          AND so.TxnDate <  DATEADD(day, 1, CAST(? AS DATETIME))
-    ),
-    OrderedAgg AS (
-        SELECT
-            {d_plu} AS PLU_Int,
-            SUM({d_qty}) AS QtyOrdered
-        FROM WPL.dbo.GP_SalesOrderLineDetail d
-        JOIN OrdersForDay o ON o.TxnID = d.TxnIDKey
-        WHERE {d_plu} IS NOT NULL
-        GROUP BY {d_plu}
-    ),
-    ShippedAgg AS (
-        SELECT
-            {s_plu} AS PLU_Int,
-            SUM({s_qty}) AS QtyShipped
-        FROM WPL.dbo.Shipped s
-        JOIN OrdersForDay o ON o.TxnID = s.OrderNum
-        WHERE {s_plu} IS NOT NULL
-        GROUP BY {s_plu}
-    ),
-    InvAgg AS (
-        SELECT
-            {w_plu} AS PLU_Int,
-            COUNT(*) AS AvailableCases
-        FROM WPL.dbo.Wip w
-        JOIN OrderedAgg oa ON oa.PLU_Int = {w_plu}
-        WHERE w.status IN ({status_sql})
-          AND {w_plu} IS NOT NULL
-        GROUP BY {w_plu}
-    )
-    SELECT
-        (SELECT COUNT(*) FROM OrdersForDay) AS SO_Count,
-        (SELECT COUNT(*) FROM OrderedAgg) AS OrderedPLU_Count,
-        (SELECT COUNT(*) FROM ShippedAgg) AS ShippedPLU_Count,
-        (SELECT COUNT(*) FROM InvAgg) AS InvPLU_Count;
-    """
+    # Expected columns (based on your upload):
+    # ['Prod','DESC','PLU','Machine','TYPE','Trays','Pcs','Type','TPM']
+    if "PLU" in df.columns:
+        df["PLU"] = df["PLU"].astype(str).str.strip()
+    if "Trays" in df.columns:
+        df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float)
+    if "TPM" in df.columns:
+        df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float)
 
-    params = (schedule_date.isoformat(), schedule_date.isoformat())
-    counts = pd.read_sql(sql_counts, conn, params=params).iloc[0].to_dict()
-
-    sql_samples_so = """
-    SELECT TOP 10 so.TxnID, so.TxnDate
-    FROM WPL.dbo.GP_SalesOrder so
-    WHERE so.TxnDate >= CAST(? AS DATETIME)
-      AND so.TxnDate <  DATEADD(day, 1, CAST(? AS DATETIME))
-    ORDER BY so.TxnID;
-    """
-    so_sample = pd.read_sql(sql_samples_so, conn, params=params)
-
-    sql_samples_detail = """
-    WITH OrdersForDay AS (
-        SELECT so.TxnID
-        FROM WPL.dbo.GP_SalesOrder so
-        WHERE so.TxnDate >= CAST(? AS DATETIME)
-          AND so.TxnDate <  DATEADD(day, 1, CAST(? AS DATETIME))
-    )
-    SELECT TOP 10
-        d.TxnIDKey,
-        d.ItemRef_FullName,
-        d.Quantity
-    FROM WPL.dbo.GP_SalesOrderLineDetail d
-    JOIN OrdersForDay o ON o.TxnID = d.TxnIDKey
-    ORDER BY d.TxnIDKey;
-    """
-    detail_sample = pd.read_sql(sql_samples_detail, conn, params=params)
-
-    sql_samples_shipped = """
-    SELECT TOP 10
-        s.OrderNum,
-        s.ProductNumber,
-        s.QtyShipped,
-        s.DateTimeStamp
-    FROM WPL.dbo.Shipped s
-    ORDER BY s.DateTimeStamp DESC;
-    """
-    shipped_sample = pd.read_sql(sql_samples_shipped, conn)
-
-    return {
-        "counts": counts,
-        "so_sample": so_sample,
-        "detail_sample": detail_sample,
-        "shipped_sample": shipped_sample,
-    }
+    return df
 
 
+def product_machines(master_df: pd.DataFrame) -> list[str]:
+    if master_df.empty or "Machine" not in master_df.columns:
+        return ["All"]
+    machines = sorted({str(x).strip() for x in master_df["Machine"].dropna().unique() if str(x).strip()})
+    return ["All"] + machines
+
+
+# -----------------------------
+# Shortsheet SQL (TxnDate)
+# Remaining = Ordered - Shipped - AvailableCases
+# -----------------------------
 def fetch_shortsheets(conn, schedule_date: date, statuses: list[str], only_remaining: bool) -> pd.DataFrame:
     if not statuses:
         statuses = ["Available"]
@@ -238,7 +181,6 @@ def fetch_shortsheets(conn, schedule_date: date, statuses: list[str], only_remai
     d_qty = sql_num_expr("d.Quantity")
     s_qty = sql_num_expr("s.QtyShipped")
 
-    # Remaining = Ordered - Shipped - Available
     remaining_expr = "(oa.QtyOrdered - ISNULL(sa.QtyShipped,0) - ISNULL(ia.AvailableCases,0))"
     where_remaining = f"WHERE {remaining_expr} > 0" if only_remaining else ""
 
@@ -296,97 +238,138 @@ def fetch_shortsheets(conn, schedule_date: date, statuses: list[str], only_remai
     if df.empty:
         return df
 
-    # Keep both numeric and padded forms
     df["ProductNumber"] = df["PLU_Int"].astype(int)
     df["PLU"] = df["PLU_Int"].astype(int).astype(str).str.zfill(5)
     df = df.drop(columns=["PLU_Int"])
+    df["RemainingCases"] = df["RemainingCases"].apply(lambda x: x if safe_float(x) > 0 else 0)
 
-    # keep Remaining non-negative
-    df["RemainingCases"] = df["RemainingCases"].apply(lambda x: x if x > 0 else 0)
+    # Consistent ordering
+    return df[["ProductNumber", "PLU", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]]
 
+
+# -----------------------------
+# Production SQL (PackDate) + includes Shipped status
+# Grouped by PLU; Machine filter happens AFTER merge to master
+# -----------------------------
+def fetch_production_by_packdate(conn, packdate_value, prod_statuses: list[str]) -> pd.DataFrame:
+    """
+    Returns columns: PLU_Int, CasesProduced, LbsProduced
+    """
+    if not prod_statuses:
+        prod_statuses = ["Available", "ScanningSalesOrder", "WaitingToBeInvoiced", "Shipped"]
+    status_sql = _build_in_list_sql(prod_statuses)
+
+    w_plu = sql_int_expr("w.plu")
+    w_wt = sql_num_expr("w.casewt")
+
+    sql = f"""
+    SELECT
+        {w_plu} AS PLU_Int,
+        COUNT(*) AS CasesProduced,
+        SUM({w_wt}) AS LbsProduced
+    FROM WPL.dbo.Wip w
+    WHERE w.packdate = ?
+      AND w.status IN ({status_sql})
+      AND {w_plu} IS NOT NULL
+    GROUP BY {w_plu}
+    ORDER BY {w_plu};
+    """
+
+    df = pd.read_sql(sql, conn, params=(packdate_value,))
+    if df.empty:
+        return df
+
+    df["ProductNumber"] = df["PLU_Int"].astype(int)
+    df["PLU"] = df["PLU_Int"].astype(int).astype(str).str.zfill(5)
+    df = df.drop(columns=["PLU_Int"])
     return df
 
 
 # -----------------------------
-# Product master merge
+# Excel export helpers
 # -----------------------------
-def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
-    if not path or not os.path.exists(path):
-        return pd.DataFrame()
-    if sheet_name.strip():
-        df = pd.read_excel(path, sheet_name=sheet_name.strip())
-    else:
-        df = pd.read_excel(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-def infer_product_cols(df: pd.DataFrame) -> dict:
-    cols = {c.lower(): c for c in df.columns}
-    plu_candidates = ["plu", "productnumber", "product_number", "itemnumber", "item_number", "code"]
-    desc_candidates = ["product description", "productdescription", "description", "desc", "name"]
-
-    def find_any(cands):
-        for k in cands:
-            if k in cols:
-                return cols[k]
-        for c in df.columns:
-            cl = c.lower()
-            for k in cands:
-                if k in cl:
-                    return c
-        return ""
-
-    return {"plu": find_any(plu_candidates), "desc": find_any(desc_candidates)}
-
-
-def merge_master(short_df: pd.DataFrame, master_df: pd.DataFrame) -> pd.DataFrame:
-    if master_df.empty:
-        return short_df
-
-    mcols = infer_product_cols(master_df)
-    if not mcols["plu"]:
-        return short_df
-
-    m = master_df.copy()
-    m[mcols["plu"]] = m[mcols["plu"]].astype(str).str.strip().str.zfill(5)
-
-    keep = [mcols["plu"]]
-    if mcols["desc"]:
-        keep.append(mcols["desc"])
-    m2 = m[keep].drop_duplicates(subset=[mcols["plu"]])
-
-    out = short_df.copy()
-    out["PLU"] = out["PLU"].astype(str).str.strip().str.zfill(5)
-
-    merged = out.merge(m2, how="left", left_on="PLU", right_on=mcols["plu"])
-
-    if mcols["plu"] in merged.columns:
-        merged = merged.drop(columns=[mcols["plu"]])
-
-    if mcols["desc"] and mcols["desc"] in merged.columns:
-        merged = merged.rename(columns={mcols["desc"]: "ProductDescription"})
-
-    desired = ["ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
-    cols = [c for c in desired if c in merged.columns] + [c for c in merged.columns if c not in desired]
-    return merged[cols]
-
-
-def export_to_excel(df: pd.DataFrame, out_path: str) -> None:
+def export_to_excel(df: pd.DataFrame, out_path: str, sheet_name: str) -> None:
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Shortsheet", index=False)
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+
+def export_multi_to_excel(tables: dict[str, pd.DataFrame], out_path: str) -> None:
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        for name, df in tables.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
 
 
 # -----------------------------
-# GUI App
+# Time helpers
+# -----------------------------
+def parse_hhmm(s: str) -> time:
+    s = (s or "").strip()
+    return datetime.strptime(s, "%H:%M").time()
+
+
+def minutes_between(start: datetime, end: datetime) -> float:
+    return max(0.0, (end - start).total_seconds() / 60.0)
+
+
+# -----------------------------
+# UI helper: Treeview
+# -----------------------------
+class TableView(ttk.Frame):
+    def __init__(self, parent, columns: list[str]):
+        super().__init__(parent)
+        self.columns = columns
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=12)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.vsb.grid(row=0, column=1, sticky="ns")
+        self.hsb.grid(row=1, column=0, sticky="ew")
+
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        for c in columns:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=120, anchor="w")
+
+    def set_dataframe(self, df: pd.DataFrame):
+        # clear
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        if df is None or df.empty:
+            return
+
+        # reset columns if needed
+        cols = list(df.columns)
+        if cols != self.columns:
+            self.columns = cols
+            self.tree.configure(columns=cols)
+            for c in cols:
+                self.tree.heading(c, text=c)
+                self.tree.column(c, width=120, anchor="w")
+
+        for _, row in df.iterrows():
+            values = [row.get(c, "") for c in self.columns]
+            self.tree.insert("", "end", values=values)
+
+
+# -----------------------------
+# Main App
 # -----------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("980x700")
+        self.geometry("1200x820")
 
         self.cfg = load_config()
+
+        # Stored last outputs (so Production can use Shortsheet totals)
+        self.last_shortsheets_df: pd.DataFrame | None = None
+        self.master_df: pd.DataFrame | None = None
 
         # Connection vars
         self.var_server = tk.StringVar(value=self.cfg.server)
@@ -396,104 +379,179 @@ class App(tk.Tk):
         self.var_user = tk.StringVar(value=self.cfg.username)
         self.var_pass = tk.StringVar(value=self.cfg.password)
 
-        # Product vars
+        # Product master vars
         self.var_product_path = tk.StringVar(value=self.cfg.product_excel_path)
         self.var_product_sheet = tk.StringVar(value=self.cfg.product_sheet_name)
 
-        # Run vars (TxnDate only)
-        self.var_schedule_date = tk.StringVar(value=date.today().isoformat())
-        self.var_only_remaining = tk.BooleanVar(value=True)
+        # Output
+        self.var_output_folder = tk.StringVar(value=self.cfg.output_folder or os.getcwd())
 
-        # WIP statuses
+        # Shortsheet inputs
+        self.var_txndate = tk.StringVar(value=date.today().isoformat())
+        self.var_only_remaining = tk.BooleanVar(value=True)
         self.var_wip_available = tk.BooleanVar(value=True)
         self.var_wip_scanning = tk.BooleanVar(value=True)
         self.var_wip_waiting = tk.BooleanVar(value=True)
 
-        self.var_output_folder = tk.StringVar(value=self.cfg.output_folder or os.getcwd())
+        # Production inputs
+        self.var_packdate = tk.StringVar(value="")
+        self.var_machine = tk.StringVar(value="All")
+        self.var_start_time = tk.StringVar(value="08:30")
+        self.var_end_time = tk.StringVar(value="17:00")
+
+        # Production statuses fixed
+        self.production_statuses = ["Available", "ScanningSalesOrder", "WaitingToBeInvoiced", "Shipped"]
 
         self._build_ui()
         self._refresh_auth_state()
         self._log("Ready.")
+        self._load_master(initial=True)
 
+    # ---------------- UI ----------------
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
-        frm_conn = ttk.LabelFrame(self, text="SQL Connection")
-        frm_conn.pack(fill="x", **pad)
+        frm_top = ttk.LabelFrame(self, text="Connection + Files")
+        frm_top.pack(fill="x", **pad)
 
-        row = 0
-        ttk.Label(frm_conn, text="Server Address:").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_conn, textvariable=self.var_server, width=45).grid(row=row, column=1, sticky="w", **pad)
+        r = 0
+        ttk.Label(frm_top, text="Server:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(frm_top, textvariable=self.var_server, width=32).grid(row=r, column=1, sticky="w", **pad)
 
-        ttk.Label(frm_conn, text="Database:").grid(row=row, column=2, sticky="w", **pad)
-        ttk.Entry(frm_conn, textvariable=self.var_database, width=18).grid(row=row, column=3, sticky="w", **pad)
+        ttk.Label(frm_top, text="Database:").grid(row=r, column=2, sticky="w", **pad)
+        ttk.Entry(frm_top, textvariable=self.var_database, width=12).grid(row=r, column=3, sticky="w", **pad)
 
-        row += 1
-        ttk.Label(frm_conn, text="ODBC Driver:").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(frm_top, text="Driver:").grid(row=r, column=4, sticky="w", **pad)
         drivers = list_odbc_drivers()
-        self.cmb_driver = ttk.Combobox(frm_conn, textvariable=self.var_driver, values=drivers, width=42)
-        self.cmb_driver.grid(row=row, column=1, sticky="w", **pad)
+        self.cmb_driver = ttk.Combobox(frm_top, textvariable=self.var_driver, values=drivers, width=28)
+        self.cmb_driver.grid(row=r, column=5, sticky="w", **pad)
         if drivers and not self.var_driver.get():
             self.var_driver.set(drivers[0])
 
-        ttk.Label(frm_conn, text="Auth Mode:").grid(row=row, column=2, sticky="w", **pad)
-        self.cmb_auth = ttk.Combobox(frm_conn, textvariable=self.var_auth, values=["windows", "sql"], width=15, state="readonly")
-        self.cmb_auth.grid(row=row, column=3, sticky="w", **pad)
+        r += 1
+        ttk.Label(frm_top, text="Auth:").grid(row=r, column=0, sticky="w", **pad)
+        self.cmb_auth = ttk.Combobox(frm_top, textvariable=self.var_auth, values=["windows", "sql"], width=10, state="readonly")
+        self.cmb_auth.grid(row=r, column=1, sticky="w", **pad)
         self.cmb_auth.bind("<<ComboboxSelected>>", lambda e: self._refresh_auth_state())
 
-        row += 1
-        ttk.Label(frm_conn, text="Username:").grid(row=row, column=0, sticky="w", **pad)
-        self.ent_user = ttk.Entry(frm_conn, textvariable=self.var_user, width=45)
-        self.ent_user.grid(row=row, column=1, sticky="w", **pad)
+        ttk.Label(frm_top, text="User:").grid(row=r, column=2, sticky="w", **pad)
+        self.ent_user = ttk.Entry(frm_top, textvariable=self.var_user, width=20)
+        self.ent_user.grid(row=r, column=3, sticky="w", **pad)
 
-        ttk.Label(frm_conn, text="Password:").grid(row=row, column=2, sticky="w", **pad)
-        self.ent_pass = ttk.Entry(frm_conn, textvariable=self.var_pass, show="*", width=18)
-        self.ent_pass.grid(row=row, column=3, sticky="w", **pad)
+        ttk.Label(frm_top, text="Pass:").grid(row=r, column=4, sticky="w", **pad)
+        self.ent_pass = ttk.Entry(frm_top, textvariable=self.var_pass, width=18, show="*")
+        self.ent_pass.grid(row=r, column=5, sticky="w", **pad)
 
-        row += 1
-        ttk.Button(frm_conn, text="Test Connection", command=self.on_test_connection).grid(row=row, column=0, sticky="w", **pad)
-        ttk.Button(frm_conn, text="Save Settings", command=self.on_save_settings).grid(row=row, column=1, sticky="w", **pad)
+        r += 1
+        ttk.Label(frm_top, text="Product Excel:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(frm_top, textvariable=self.var_product_path, width=60).grid(row=r, column=1, columnspan=3, sticky="w", **pad)
+        ttk.Button(frm_top, text="Browse", command=self.on_browse_product).grid(row=r, column=4, sticky="w", **pad)
+        ttk.Button(frm_top, text="Load Master", command=self._load_master).grid(row=r, column=5, sticky="w", **pad)
 
-        frm_prod = ttk.LabelFrame(self, text="Product Master Excel (optional for description)")
-        frm_prod.pack(fill="x", **pad)
+        r += 1
+        ttk.Label(frm_top, text="Output Folder:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(frm_top, textvariable=self.var_output_folder, width=60).grid(row=r, column=1, columnspan=3, sticky="w", **pad)
+        ttk.Button(frm_top, text="Browse", command=self.on_browse_output).grid(row=r, column=4, sticky="w", **pad)
+        ttk.Button(frm_top, text="Test Connection", command=self.on_test_connection).grid(row=r, column=5, sticky="w", **pad)
 
-        row = 0
-        ttk.Label(frm_prod, text="Excel File Path:").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_prod, textvariable=self.var_product_path, width=72).grid(row=row, column=1, sticky="w", **pad)
-        ttk.Button(frm_prod, text="Browse...", command=self.on_browse_product).grid(row=row, column=2, sticky="w", **pad)
+        r += 1
+        ttk.Button(frm_top, text="Save Settings", command=self.on_save_settings).grid(row=r, column=0, sticky="w", **pad)
 
-        row += 1
-        ttk.Label(frm_prod, text="Sheet Name (optional):").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_prod, textvariable=self.var_product_sheet, width=30).grid(row=row, column=1, sticky="w", **pad)
+        # Tabs
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, **pad)
 
-        frm_run = ttk.LabelFrame(self, text="Shortsheet Run (TxnDate)")
-        frm_run.pack(fill="x", **pad)
+        self.tab_short = ttk.Frame(self.nb)
+        self.tab_prod = ttk.Frame(self.nb)
 
-        row = 0
-        ttk.Label(frm_run, text="Schedule Date (YYYY-MM-DD):").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_run, textvariable=self.var_schedule_date, width=18).grid(row=row, column=1, sticky="w", **pad)
+        self.nb.add(self.tab_short, text="Shortsheet (TxnDate)")
+        self.nb.add(self.tab_prod, text="Production (PackDate)")
 
-        ttk.Checkbutton(frm_run, text="Only Remaining (>0)", variable=self.var_only_remaining).grid(row=row, column=2, sticky="w", **pad)
+        self._build_tab_shortsheets()
+        self._build_tab_production()
 
-        row += 1
-        ttk.Label(frm_run, text="WIP statuses included in AvailableCases:").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Checkbutton(frm_run, text="Available", variable=self.var_wip_available).grid(row=row, column=1, sticky="w", **pad)
-        ttk.Checkbutton(frm_run, text="ScanningSalesOrder", variable=self.var_wip_scanning).grid(row=row, column=2, sticky="w", **pad)
-        ttk.Checkbutton(frm_run, text="WaitingToBeInvoiced", variable=self.var_wip_waiting).grid(row=row, column=3, sticky="w", **pad)
-
-        row += 1
-        ttk.Label(frm_run, text="Output Folder:").grid(row=row, column=0, sticky="w", **pad)
-        ttk.Entry(frm_run, textvariable=self.var_output_folder, width=45).grid(row=row, column=1, sticky="w", **pad)
-        ttk.Button(frm_run, text="Browse...", command=self.on_browse_output).grid(row=row, column=2, sticky="w", **pad)
-
-        ttk.Button(frm_run, text="Build Shortsheet", command=self.on_build).grid(row=row, column=3, sticky="w", **pad)
-        ttk.Button(frm_run, text="Run Diagnostics", command=self.on_diagnostics).grid(row=row, column=4, sticky="w", **pad)
-
+        # Log
         frm_log = ttk.LabelFrame(self, text="Log")
-        frm_log.pack(fill="both", expand=True, **pad)
-
-        self.txt_log = tk.Text(frm_log, height=16, wrap="word")
+        frm_log.pack(fill="both", expand=False, **pad)
+        self.txt_log = tk.Text(frm_log, height=10, wrap="word")
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def _build_tab_shortsheets(self):
+        pad = {"padx": 10, "pady": 6}
+
+        frm = ttk.LabelFrame(self.tab_short, text="Inputs")
+        frm.pack(fill="x", **pad)
+
+        r = 0
+        ttk.Label(frm, text="TxnDate (YYYY-MM-DD):").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_txndate, width=16).grid(row=r, column=1, sticky="w", **pad)
+
+        ttk.Checkbutton(frm, text="Only Remaining (>0)", variable=self.var_only_remaining).grid(row=r, column=2, sticky="w", **pad)
+
+        r += 1
+        ttk.Label(frm, text="WIP statuses to count as AvailableCases:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Checkbutton(frm, text="Available", variable=self.var_wip_available).grid(row=r, column=1, sticky="w", **pad)
+        ttk.Checkbutton(frm, text="ScanningSalesOrder", variable=self.var_wip_scanning).grid(row=r, column=2, sticky="w", **pad)
+        ttk.Checkbutton(frm, text="WaitingToBeInvoiced", variable=self.var_wip_waiting).grid(row=r, column=3, sticky="w", **pad)
+
+        r += 1
+        ttk.Button(frm, text="Run Shortsheet", command=self.on_run_shortsheets).grid(row=r, column=0, sticky="w", **pad)
+        ttk.Button(frm, text="Export Shortsheet Excel", command=self.on_export_shortsheets).grid(row=r, column=1, sticky="w", **pad)
+
+        # Table
+        self.short_table = TableView(self.tab_short, columns=[
+            "ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"
+        ])
+        self.short_table.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def _build_tab_production(self):
+        pad = {"padx": 10, "pady": 6}
+
+        frm = ttk.LabelFrame(self.tab_prod, text="Inputs")
+        frm.pack(fill="x", **pad)
+
+        r = 0
+        ttk.Label(frm, text="PackDate (4-digit code):").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_packdate, width=10).grid(row=r, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="Machine:").grid(row=r, column=2, sticky="w", **pad)
+        self.cmb_machine = ttk.Combobox(frm, textvariable=self.var_machine, values=["All"], width=10, state="readonly")
+        self.cmb_machine.grid(row=r, column=3, sticky="w", **pad)
+
+        ttk.Label(frm, text="Start (HH:MM):").grid(row=r, column=4, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_start_time, width=8).grid(row=r, column=5, sticky="w", **pad)
+
+        ttk.Label(frm, text="End (HH:MM):").grid(row=r, column=6, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_end_time, width=8).grid(row=r, column=7, sticky="w", **pad)
+
+        r += 1
+        ttk.Button(frm, text="Refresh Production", command=self.on_refresh_production).grid(row=r, column=0, sticky="w", **pad)
+        ttk.Button(frm, text="Export Production Excel", command=self.on_export_production).grid(row=r, column=1, sticky="w", **pad)
+
+        # Summary box
+        self.prod_summary = tk.Text(self.tab_prod, height=8, wrap="word")
+        self.prod_summary.pack(fill="x", padx=10, pady=10)
+
+        # Tables
+        self.prod_table = TableView(self.tab_prod, columns=[
+            "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
+            "CasesProduced", "LbsProduced", "TraysProduced"
+        ])
+        ttk.Label(self.tab_prod, text="Production by PLU").pack(anchor="w", padx=10)
+        self.prod_table.pack(fill="both", expand=True, padx=10, pady=6)
+
+        self.primal_table = TableView(self.tab_prod, columns=[
+            "Machine", "Type", "CasesProduced", "LbsProduced", "TraysProduced"
+        ])
+        ttk.Label(self.tab_prod, text="Production by Primal (Type)").pack(anchor="w", padx=10)
+        self.primal_table.pack(fill="both", expand=True, padx=10, pady=6)
+
+    # -------------- common helpers --------------
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.txt_log.insert("end", f"[{ts}] {msg}\n")
+        self.txt_log.see("end")
+        self.update_idletasks()
 
     def _refresh_auth_state(self):
         is_sql = self.var_auth.get().strip().lower() == "sql"
@@ -514,19 +572,13 @@ class App(tk.Tk):
             output_folder=self.var_output_folder.get().strip(),
         )
 
-    def _log(self, msg: str):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.txt_log.insert("end", f"[{ts}] {msg}\n")
-        self.txt_log.see("end")
-        self.update_idletasks()
-
-    def _parse_date(self) -> date:
-        return datetime.strptime(self.var_schedule_date.get().strip(), "%Y-%m-%d").date()
-
     def _connect(self, cfg: AppConfig):
-        return pyodbc.connect(build_connection_string(cfg), timeout=20)
+        return pyodbc.connect(build_connection_string(cfg), timeout=25)
 
-    def _get_status_list(self) -> list[str]:
+    def _parse_txndate(self) -> date:
+        return datetime.strptime(self.var_txndate.get().strip(), "%Y-%m-%d").date()
+
+    def _get_short_wip_statuses(self) -> list[str]:
         statuses = []
         if self.var_wip_available.get():
             statuses.append("Available")
@@ -534,7 +586,48 @@ class App(tk.Tk):
             statuses.append("ScanningSalesOrder")
         if self.var_wip_waiting.get():
             statuses.append("WaitingToBeInvoiced")
-        return statuses
+        return statuses or ["Available"]
+
+    def _load_master(self, initial: bool = False):
+        try:
+            path = self.var_product_path.get().strip()
+            sheet = self.var_product_sheet.get().strip()
+            if not path or not os.path.exists(path):
+                if not initial:
+                    messagebox.showwarning("Product Master", "Product Excel not found. Browse to your Product Info.xlsx.")
+                self.master_df = pd.DataFrame()
+                self.cmb_machine.configure(values=["All"])
+                self.var_machine.set("All")
+                return
+
+            self._log(f"Loading product master: {path}")
+            self.master_df = load_product_master(path, sheet)
+            self._log(f"Loaded product master rows: {len(self.master_df):,}")
+
+            machines = product_machines(self.master_df)
+            self.cmb_machine.configure(values=machines)
+            if self.var_machine.get() not in machines:
+                self.var_machine.set("All")
+        except Exception as e:
+            self._log(f"ERROR loading product master: {e}")
+            self._log(traceback.format_exc())
+            if not initial:
+                messagebox.showerror("Product Master Error", str(e))
+            self.master_df = pd.DataFrame()
+
+    # -------------- buttons --------------
+    def on_browse_product(self):
+        path = filedialog.askopenfilename(
+            title="Select Product Info Excel",
+            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
+        )
+        if path:
+            self.var_product_path.set(path)
+
+    def on_browse_output(self):
+        folder = filedialog.askdirectory(title="Select Output Folder")
+        if folder:
+            self.var_output_folder.set(folder)
 
     def on_save_settings(self):
         self.cfg = self._collect_config()
@@ -546,125 +639,334 @@ class App(tk.Tk):
         ok, msg = test_connection(cfg)
         self._log(msg)
         if ok:
-            messagebox.showinfo("Test Connection", msg)
+            messagebox.showinfo("Connection", msg)
         else:
-            messagebox.showerror("Test Connection", msg)
+            messagebox.showerror("Connection", msg)
 
-    def on_browse_product(self):
-        path = filedialog.askopenfilename(
-            title="Select Product Master Excel",
-            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
-        )
-        if path:
-            self.var_product_path.set(path)
-
-    def on_browse_output(self):
-        folder = filedialog.askdirectory(title="Select Output Folder")
-        if folder:
-            self.var_output_folder.set(folder)
-
-    def on_diagnostics(self):
+    # ---------------- Shortsheet actions ----------------
+    def on_run_shortsheets(self):
         if pyodbc is None:
             messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
             return
 
-        cfg = self._collect_config()
-        statuses = self._get_status_list()
+        self._load_master(initial=True)
 
         try:
-            sched = self._parse_date()
+            txnd = self._parse_txndate()
         except ValueError:
-            messagebox.showerror("Invalid Date", "Enter date as YYYY-MM-DD.")
+            messagebox.showerror("TxnDate", "Enter TxnDate as YYYY-MM-DD.")
             return
 
-        try:
-            self._log("Connecting to SQL Server for diagnostics...")
-            with self._connect(cfg) as conn:
-                diag = run_diagnostics(conn, sched, statuses)
-
-            c = diag["counts"]
-            self._log(f"Diagnostics for {sched.isoformat()} using TxnDate")
-            self._log(f"  SO_Count: {c.get('SO_Count')}")
-            self._log(f"  OrderedPLU_Count: {c.get('OrderedPLU_Count')}")
-            self._log(f"  ShippedPLU_Count: {c.get('ShippedPLU_Count')}")
-            self._log(f"  InvPLU_Count: {c.get('InvPLU_Count')}")
-
-            self._log("Sample SO TxnIDs:")
-            for _, r in diag["so_sample"].iterrows():
-                self._log(f"  {r['TxnID']} | {r['TxnDate']}")
-
-            self._log("Sample SO Detail lines:")
-            for _, r in diag["detail_sample"].iterrows():
-                self._log(f"  TxnIDKey={r['TxnIDKey']}  PLU={r['ItemRef_FullName']}  Qty={r['Quantity']}")
-
-            self._log("Latest Shipped rows:")
-            for _, r in diag["shipped_sample"].iterrows():
-                self._log(f"  OrderNum={r['OrderNum']}  PLU={r['ProductNumber']}  Shipped={r['QtyShipped']}  DT={r['DateTimeStamp']}")
-
-            messagebox.showinfo("Diagnostics", "Diagnostics written to log.")
-        except Exception as e:
-            self._log("ERROR diagnostics:")
-            self._log(str(e))
-            self._log(traceback.format_exc())
-            messagebox.showerror("Diagnostics Error", str(e))
-
-    def on_build(self):
-        if pyodbc is None:
-            messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
-            return
-
-        cfg = self._collect_config()
-        statuses = self._get_status_list()
+        statuses = self._get_short_wip_statuses()
         only_remaining = bool(self.var_only_remaining.get())
 
         try:
-            sched = self._parse_date()
-        except ValueError:
-            messagebox.showerror("Invalid Date", "Enter date as YYYY-MM-DD.")
-            return
-
-        master_df = pd.DataFrame()
-        try:
-            master_df = load_product_master(cfg.product_excel_path, cfg.product_sheet_name)
-            if not master_df.empty:
-                self._log(f"Loaded product master rows: {len(master_df):,}")
-        except Exception as e:
-            self._log(f"WARNING: product master load failed: {e}")
-
-        try:
-            self._log("Connecting to SQL Server...")
+            cfg = self._collect_config()
+            self._log("Connecting to SQL Server (shortsheet)...")
             with self._connect(cfg) as conn:
-                self._log(f"Running shortsheet for {sched.isoformat()} using TxnDate ...")
-                df = fetch_shortsheets(conn, sched, statuses, only_remaining)
-            self._log(f"Rows returned: {len(df):,}")
+                df = fetch_shortsheets(conn, txnd, statuses, only_remaining)
+
+            if df.empty:
+                self._log("Shortsheet returned 0 rows.")
+                self.last_shortsheets_df = df
+                self.short_table.set_dataframe(pd.DataFrame(columns=self.short_table.columns))
+                messagebox.showinfo("Shortsheet", "No remaining balances found.")
+                return
+
+            # Merge description + trays + tpm + type + machine from master
+            df2 = df.copy()
+            if self.master_df is not None and not self.master_df.empty:
+                m = self.master_df.copy()
+                m["PLU"] = m["PLU"].astype(str).str.strip().str.zfill(5)
+                df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
+                df2 = df2.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine"]], on="PLU", how="left")
+                df2 = df2.rename(columns={
+                    "DESC": "ProductDescription",
+                    "Trays": "TraysPerCase",
+                    "TPM": "StdTPM"
+                })
+            else:
+                df2["ProductDescription"] = ""
+
+            # Ensure columns order for display
+            show_cols = ["ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
+            for c in show_cols:
+                if c not in df2.columns:
+                    df2[c] = ""
+            df2 = df2[show_cols]
+
+            self.last_shortsheets_df = df2
+            self.short_table.set_dataframe(df2)
+            self._log(f"Shortsheet rows: {len(df2):,}")
         except Exception as e:
-            self._log("ERROR running shortsheet query:")
-            self._log(str(e))
+            self._log(f"ERROR shortsheet: {e}")
             self._log(traceback.format_exc())
-            messagebox.showerror("SQL Error", str(e))
+            messagebox.showerror("Shortsheet Error", str(e))
+
+    def on_export_shortsheets(self):
+        if self.last_shortsheets_df is None or self.last_shortsheets_df.empty:
+            messagebox.showinfo("Export", "Run Shortsheet first.")
             return
 
-        if df.empty:
-            self._log("No results returned. Run Diagnostics to confirm shipped/order joins.")
-            messagebox.showinfo("No Results", "No results returned. Run Diagnostics.")
-            return
+        out_folder = self.var_output_folder.get().strip() or os.getcwd()
+        os.makedirs(out_folder, exist_ok=True)
 
         try:
-            if not master_df.empty:
-                df = merge_master(df, master_df)
+            txnd = self._parse_txndate()
+        except ValueError:
+            txnd = date.today()
+
+        out_path = os.path.join(out_folder, f"Shortsheet_TxnDate_{txnd.isoformat()}.xlsx")
+        try:
+            export_to_excel(self.last_shortsheets_df, out_path, "Shortsheet")
+            self._log(f"Exported shortsheet: {out_path}")
+            messagebox.showinfo("Export", f"Saved:\n{out_path}")
         except Exception as e:
-            self._log(f"WARNING: description merge failed: {e}")
+            self._log(f"ERROR exporting shortsheet: {e}")
+            messagebox.showerror("Export Error", str(e))
+
+    # ---------------- Production actions ----------------
+    def on_refresh_production(self):
+        if pyodbc is None:
+            messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
+            return
+
+        self._load_master(initial=True)
+        if self.master_df is None or self.master_df.empty:
+            messagebox.showerror("Product Master", "Load Product Info.xlsx first (needed for Machine filter + trays + TPM).")
+            return
+
+        pack = (self.var_packdate.get() or "").strip()
+        if not pack:
+            messagebox.showerror("PackDate", "Enter the 4-digit packdate code (e.g., 1307).")
+            return
+
+        # packdate might be stored as int; pass as int if numeric
+        pack_param = int(pack) if pack.isdigit() else pack
+
+        machine_filter = (self.var_machine.get() or "All").strip()
+
+        # times
+        try:
+            st = parse_hhmm(self.var_start_time.get())
+            et = parse_hhmm(self.var_end_time.get())
+        except Exception:
+            messagebox.showerror("Time", "Enter Start/End time as HH:MM (24-hour), e.g., 08:30")
+            return
+
+        now = datetime.now()
+        today = now.date()
+        start_dt = datetime.combine(today, st)
+        end_dt = datetime.combine(today, et)
+
+        if end_dt <= start_dt:
+            # allow overnight? For now treat as next day
+            end_dt = end_dt + timedelta(days=1)
+
+        minutes_ran = minutes_between(start_dt, now)
+        minutes_left_clock = max(0.0, minutes_between(now, end_dt))
 
         try:
-            out_folder = cfg.output_folder or os.getcwd()
+            cfg = self._collect_config()
+            self._log("Connecting to SQL Server (production)...")
+            with self._connect(cfg) as conn:
+                prod_df = fetch_production_by_packdate(conn, pack_param, self.production_statuses)
+
+            if prod_df.empty:
+                self._log("Production query returned 0 rows.")
+                self._set_production_outputs_empty()
+                messagebox.showinfo("Production", "No production found for that packdate/status set.")
+                return
+
+            # Merge to master for DESC / Trays / TPM / Type / Machine
+            m = self.master_df.copy()
+            m["PLU"] = m["PLU"].astype(str).str.strip().str.zfill(5)
+            prod_df["PLU"] = prod_df["PLU"].astype(str).str.strip().str.zfill(5)
+
+            merged = prod_df.merge(
+                m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine"]],
+                on="PLU",
+                how="left"
+            )
+
+            merged = merged.rename(columns={
+                "Trays": "TraysPerCase",
+                "TPM": "StdTPM"
+            })
+
+            # Fill missing master values
+            merged["Machine"] = merged["Machine"].fillna("Unknown")
+            merged["Type"] = merged["Type"].fillna("Unknown")
+            merged["DESC"] = merged["DESC"].fillna("")
+            merged["TraysPerCase"] = pd.to_numeric(merged["TraysPerCase"], errors="coerce").fillna(0).astype(float)
+            merged["StdTPM"] = pd.to_numeric(merged["StdTPM"], errors="coerce").fillna(0).astype(float)
+            merged["CasesProduced"] = pd.to_numeric(merged["CasesProduced"], errors="coerce").fillna(0).astype(float)
+            merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
+
+            # Machine filter (B)
+            if machine_filter != "All":
+                merged = merged[merged["Machine"].astype(str).str.strip() == machine_filter].copy()
+
+            # Compute trays produced
+            merged["TraysProduced"] = merged["CasesProduced"] * merged["TraysPerCase"]
+
+            # Totals
+            total_cases = float(merged["CasesProduced"].sum())
+            total_lbs = float(merged["LbsProduced"].sum())
+            total_trays = float(merged["TraysProduced"].sum())
+
+            # Actual rate
+            actual_tpm = (total_trays / minutes_ran) if minutes_ran > 0 else 0.0
+
+            # Trays left to pack based on last shortsheet
+            trays_left = 0.0
+            if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty:
+                ss = self.last_shortsheets_df.copy()
+
+                # Bring in trays per case from master
+                ss["PLU"] = ss["PLU"].astype(str).str.zfill(5)
+                ss2 = ss.merge(m[["PLU", "Trays"]], on="PLU", how="left")
+                ss2["Trays"] = pd.to_numeric(ss2["Trays"], errors="coerce").fillna(0).astype(float)
+                ss2["RemainingCases"] = pd.to_numeric(ss2["RemainingCases"], errors="coerce").fillna(0).astype(float)
+                ss2["TraysLeft"] = ss2["RemainingCases"] * ss2["Trays"]
+                trays_left = float(ss2["TraysLeft"].sum())
+
+            # Estimated minutes left based on actual TPM
+            est_minutes_left = (trays_left / actual_tpm) if actual_tpm > 0 else 0.0
+            projected_finish = (now + timedelta(minutes=est_minutes_left)) if actual_tpm > 0 else None
+
+            # Standard TPM (weighted by trays produced)
+            std_weighted_tpm = 0.0
+            if total_trays > 0:
+                std_weighted_tpm = float((merged["StdTPM"] * merged["TraysProduced"]).sum() / total_trays)
+
+            std_minutes_left = (trays_left / std_weighted_tpm) if std_weighted_tpm > 0 else 0.0
+            std_finish = (now + timedelta(minutes=std_minutes_left)) if std_weighted_tpm > 0 else None
+
+            # Build display tables
+            merged_display = merged[[
+                "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
+                "CasesProduced", "LbsProduced", "TraysProduced"
+            ]].copy()
+
+            merged_display = merged_display.sort_values(by=["Machine", "Type", "TraysProduced"], ascending=[True, True, False])
+
+            primal = merged.groupby(["Machine", "Type"], as_index=False).agg(
+                CasesProduced=("CasesProduced", "sum"),
+                LbsProduced=("LbsProduced", "sum"),
+                TraysProduced=("TraysProduced", "sum"),
+            )
+            primal = primal.sort_values(by=["Machine", "TraysProduced"], ascending=[True, False])
+
+            # Summary text
+            self.prod_summary.delete("1.0", "end")
+            lines = []
+            lines.append(f"PackDate: {pack}   |   Machine: {machine_filter}")
+            lines.append(f"Statuses counted: {', '.join(self.production_statuses)}")
+            lines.append("")
+            lines.append(f"TOTALS Produced -> Cases: {total_cases:,.0f}   Lbs: {total_lbs:,.1f}   Trays: {total_trays:,.0f}")
+            lines.append(f"Run Time -> Start: {start_dt.strftime('%H:%M')}   Now: {now.strftime('%H:%M')}   Minutes ran: {minutes_ran:,.1f}")
+            lines.append(f"Clock -> End: {end_dt.strftime('%H:%M')}   Minutes left (clock): {minutes_left_clock:,.1f}")
+            lines.append("")
+            lines.append(f"Actual TPM so far: {actual_tpm:,.2f}")
+            if trays_left > 0:
+                lines.append(f"Trays left to pack (from Shortsheet): {trays_left:,.0f}")
+            else:
+                lines.append("Trays left to pack: (Run Shortsheet to populate this)")
+            if projected_finish is not None:
+                lines.append(f"Estimated minutes left (actual): {est_minutes_left:,.1f}   |   Projected finish: {projected_finish.strftime('%H:%M')}")
+            else:
+                lines.append("Estimated minutes left (actual): N/A (Actual TPM is 0)")
+
+            lines.append("")
+            lines.append(f"Standard TPM (weighted): {std_weighted_tpm:,.2f}")
+            if std_finish is not None:
+                lines.append(f"Estimated minutes left (standard): {std_minutes_left:,.1f}   |   Standard finish: {std_finish.strftime('%H:%M')}")
+            else:
+                lines.append("Estimated minutes left (standard): N/A (StdTPM is 0 or missing)")
+
+            self.prod_summary.insert("end", "\n".join(lines))
+
+            # Set tables
+            self.prod_table.set_dataframe(merged_display)
+            self.primal_table.set_dataframe(primal)
+
+            self._log(f"Production rows (PLU): {len(merged_display):,}")
+        except Exception as e:
+            self._log(f"ERROR production: {e}")
+            self._log(traceback.format_exc())
+            messagebox.showerror("Production Error", str(e))
+
+    def _set_production_outputs_empty(self):
+        self.prod_summary.delete("1.0", "end")
+        self.prod_table.set_dataframe(pd.DataFrame(columns=self.prod_table.columns))
+        self.primal_table.set_dataframe(pd.DataFrame(columns=self.primal_table.columns))
+
+    def on_export_production(self):
+        # Export what's currently displayed in tables by reusing the treeview data is messy;
+        # we recompute from packdate for accuracy.
+        if self.master_df is None or self.master_df.empty:
+            messagebox.showinfo("Export", "Load Product Info.xlsx first.")
+            return
+
+        pack = (self.var_packdate.get() or "").strip()
+        if not pack:
+            messagebox.showinfo("Export", "Enter PackDate and Refresh Production first.")
+            return
+
+        pack_param = int(pack) if pack.isdigit() else pack
+        machine_filter = (self.var_machine.get() or "All").strip()
+
+        try:
+            cfg = self._collect_config()
+            with self._connect(cfg) as conn:
+                prod_df = fetch_production_by_packdate(conn, pack_param, self.production_statuses)
+
+            if prod_df.empty:
+                messagebox.showinfo("Export", "No production rows to export.")
+                return
+
+            m = self.master_df.copy()
+            m["PLU"] = m["PLU"].astype(str).str.strip().str.zfill(5)
+            prod_df["PLU"] = prod_df["PLU"].astype(str).str.strip().str.zfill(5)
+
+            merged = prod_df.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine"]], on="PLU", how="left")
+            merged = merged.rename(columns={"Trays": "TraysPerCase", "TPM": "StdTPM"})
+            merged["Machine"] = merged["Machine"].fillna("Unknown")
+            merged["Type"] = merged["Type"].fillna("Unknown")
+            merged["DESC"] = merged["DESC"].fillna("")
+            merged["TraysPerCase"] = pd.to_numeric(merged["TraysPerCase"], errors="coerce").fillna(0).astype(float)
+            merged["StdTPM"] = pd.to_numeric(merged["StdTPM"], errors="coerce").fillna(0).astype(float)
+            merged["CasesProduced"] = pd.to_numeric(merged["CasesProduced"], errors="coerce").fillna(0).astype(float)
+            merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
+            merged["TraysProduced"] = merged["CasesProduced"] * merged["TraysPerCase"]
+
+            if machine_filter != "All":
+                merged = merged[merged["Machine"].astype(str).str.strip() == machine_filter].copy()
+
+            primal = merged.groupby(["Machine", "Type"], as_index=False).agg(
+                CasesProduced=("CasesProduced", "sum"),
+                LbsProduced=("LbsProduced", "sum"),
+                TraysProduced=("TraysProduced", "sum"),
+            )
+
+            out_folder = self.var_output_folder.get().strip() or os.getcwd()
             os.makedirs(out_folder, exist_ok=True)
-            out_path = os.path.join(out_folder, f"Shortsheet_TxnDate_{sched.isoformat()}.xlsx")
-            self._log(f"Exporting: {out_path}")
-            export_to_excel(df, out_path)
-            self._log("Export complete.")
-            messagebox.showinfo("Done", f"Shortsheet created:\n{out_path}")
+            out_path = os.path.join(out_folder, f"Production_PackDate_{pack}_{machine_filter}.xlsx")
+
+            export_multi_to_excel({
+                "ProductionByPLU": merged[[
+                    "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
+                    "CasesProduced", "LbsProduced", "TraysProduced"
+                ]].sort_values(by=["Machine", "Type", "TraysProduced"], ascending=[True, True, False]),
+                "ProductionByType": primal.sort_values(by=["Machine", "TraysProduced"], ascending=[True, False]),
+            }, out_path)
+
+            self._log(f"Exported production: {out_path}")
+            messagebox.showinfo("Export", f"Saved:\n{out_path}")
         except Exception as e:
-            self._log(f"ERROR exporting: {e}")
+            self._log(f"ERROR exporting production: {e}")
+            self._log(traceback.format_exc())
             messagebox.showerror("Export Error", str(e))
 
 
