@@ -17,6 +17,10 @@ except ImportError:
 APP_NAME = "Shortsheet + Production Builder"
 CONFIG_FILE = "config.json"
 
+# Machine mapping (your rule)
+MACHINE_OSSID = "O"
+MACHINE_REPAK = "R"
+
 
 # -----------------------------
 # Config model
@@ -38,7 +42,7 @@ def load_config() -> AppConfig:
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = json.load(f)
             merged = {**AppConfig().__dict__, **data}
             return AppConfig(**merged)
         except Exception:
@@ -143,7 +147,6 @@ def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Normalize expected columns
     if "PLU" in df.columns:
         df["PLU"] = df["PLU"].astype(str).str.strip().str.zfill(5)
     if "Trays" in df.columns:
@@ -156,6 +159,12 @@ def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
         df["Type"] = df["Type"].astype(str).str.strip()
     if "DESC" in df.columns:
         df["DESC"] = df["DESC"].astype(str).fillna("")
+
+    # NEW: Frozen flag normalization (exclude when = 'Y')
+    if "Frozen" in df.columns:
+        df["Frozen"] = df["Frozen"].astype(str).str.strip().str.upper()
+    else:
+        df["Frozen"] = ""
 
     return df
 
@@ -353,20 +362,39 @@ class TableView(ttk.Frame):
 
 
 # -----------------------------
-# Dashboard widgets
+# Dashboard KPI widgets
 # -----------------------------
-class KpiLabel(ttk.Frame):
-    """A simple KPI block on a dark background."""
-    def __init__(self, parent, title: str):
-        super().__init__(parent)
-        self.configure(style="Dash.TFrame")
-        self.title = ttk.Label(self, text=title, style="DashTitle.TLabel")
-        self.value = ttk.Label(self, text="—", style="DashValue.TLabel")
+class KpiBlock(tk.Frame):
+    def __init__(self, parent, title: str, value_color="#00ff00"):
+        super().__init__(parent, bg="#000000")
+        self.title = tk.Label(self, text=title, bg="#000000", fg="#00ff00", font=("Segoe UI", 18, "bold"))
+        self.value = tk.Label(self, text="—", bg="#000000", fg=value_color, font=("Segoe UI", 22, "bold"))
         self.title.pack(anchor="center", pady=(2, 0))
-        self.value.pack(anchor="center", pady=(0, 6))
+        self.value.pack(anchor="center", pady=(0, 8))
 
     def set_value(self, text: str):
         self.value.configure(text=text)
+
+
+class RatioBlock(tk.Frame):
+    def __init__(self, parent, title: str):
+        super().__init__(parent, bg="#000000")
+        tk.Label(self, text=title, bg="#000000", fg="#00ff00", font=("Segoe UI", 16, "bold")).pack(pady=(0, 6))
+
+        grid = tk.Frame(self, bg="#000000")
+        grid.pack()
+
+        tk.Label(grid, text="OSSID", bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, padx=18)
+        tk.Label(grid, text="REPAK", bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).grid(row=0, column=1, padx=18)
+
+        self.ossid = tk.Label(grid, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 16, "bold"))
+        self.repak = tk.Label(grid, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 16, "bold"))
+        self.ossid.grid(row=1, column=0, padx=18)
+        self.repak.grid(row=1, column=1, padx=18)
+
+    def set_values(self, ossid_val: str, repak_val: str):
+        self.ossid.configure(text=ossid_val)
+        self.repak.configure(text=repak_val)
 
 
 # -----------------------------
@@ -376,12 +404,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1300x880")
+        self.geometry("1400x900")
 
         self.cfg = load_config()
+
         self.last_shortsheets_df: pd.DataFrame | None = None
-        self.last_production_df: pd.DataFrame | None = None
-        self.last_primal_df: pd.DataFrame | None = None
+        self.last_production_full_df: pd.DataFrame | None = None
         self.master_df: pd.DataFrame | None = None
 
         # Connection vars
@@ -399,8 +427,9 @@ class App(tk.Tk):
         # Output
         self.var_output_folder = tk.StringVar(value=self.cfg.output_folder or os.getcwd())
 
-        # Global option: exclude missing PLUs from Product Info.xlsx
+        # Global options
         self.var_exclude_missing = tk.BooleanVar(value=True)
+        self.var_exclude_frozen = tk.BooleanVar(value=False)  # NEW
 
         # Shortsheet inputs
         self.var_txndate = tk.StringVar(value=date.today().isoformat())
@@ -417,18 +446,10 @@ class App(tk.Tk):
 
         self.production_statuses = ["Available", "ScanningSalesOrder", "WaitingToBeInvoiced", "Shipped"]
 
-        self._build_styles()
         self._build_ui()
         self._refresh_auth_state()
         self._log("Ready.")
         self._load_master(initial=True)
-
-    def _build_styles(self):
-        style = ttk.Style(self)
-        style.configure("Dash.TFrame", background="#000000")
-        style.configure("DashTitle.TLabel", background="#000000", foreground="#00ff00", font=("Segoe UI", 18, "bold"))
-        style.configure("DashValue.TLabel", background="#000000", foreground="#00ff00", font=("Segoe UI", 22, "bold"))
-        style.configure("DashSmall.TLabel", background="#000000", foreground="#00ff00", font=("Segoe UI", 12, "bold"))
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -481,13 +502,16 @@ class App(tk.Tk):
         ttk.Checkbutton(frm_top, text="Exclude PLUs missing from Product Info.xlsx", variable=self.var_exclude_missing).grid(
             row=r, column=0, columnspan=3, sticky="w", **pad
         )
-        ttk.Button(frm_top, text="Save Settings", command=self.on_save_settings).grid(row=r, column=4, sticky="w", **pad)
+        ttk.Checkbutton(frm_top, text="Exclude Frozen Items (Frozen = Y)", variable=self.var_exclude_frozen).grid(
+            row=r, column=3, columnspan=2, sticky="w", **pad
+        )
+        ttk.Button(frm_top, text="Save Settings", command=self.on_save_settings).grid(row=r, column=5, sticky="w", **pad)
 
         # Tabs
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, **pad)
 
-        self.tab_dash = ttk.Frame(self.nb)
+        self.tab_dash = tk.Frame(self.nb, bg="#000000")
         self.tab_short = ttk.Frame(self.nb)
         self.tab_prod = ttk.Frame(self.nb)
 
@@ -506,49 +530,62 @@ class App(tk.Tk):
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=10)
 
     def _build_tab_dashboard(self):
-        # dark background
-        self.tab_dash.configure(style="Dash.TFrame")
-        self.tab_dash.configure()
+        self.lbl_dash_time = tk.Label(self.tab_dash, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 10, "bold"))
+        self.lbl_dash_time.place(relx=0.98, rely=0.02, anchor="ne")
 
-        # make a black canvas-like area using a Frame
-        bg = ttk.Frame(self.tab_dash, style="Dash.TFrame")
-        bg.pack(fill="both", expand=True)
+        row1 = tk.Frame(self.tab_dash, bg="#000000")
+        row1.pack(fill="x", padx=30, pady=(25, 10))
 
-        # Header time
-        self.lbl_dash_time = ttk.Label(bg, text="—", style="DashSmall.TLabel")
-        self.lbl_dash_time.pack(anchor="ne", padx=15, pady=10)
+        self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
+        self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")
+        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COMPLETE", value_color="#ff2b2b")
 
-        # KPI grid
-        kpi_row = ttk.Frame(bg, style="Dash.TFrame")
-        kpi_row.pack(fill="x", padx=20, pady=10)
+        self.kpi_traypack.pack(side="left", padx=40)
+        self.kpi_traysmin.pack(side="left", padx=40)
+        self.kpi_trays_to_complete.pack(side="right", padx=40)
 
-        self.kpi_trays = KpiLabel(kpi_row, "TRAY PACK")
-        self.kpi_tpm = KpiLabel(kpi_row, "TRAYS/MIN")
-        self.kpi_cases = KpiLabel(kpi_row, "TP CASES")
-        self.kpi_cpm = KpiLabel(kpi_row, "CASES/MIN")
-        self.kpi_trays_left = KpiLabel(kpi_row, "TRAYS TO COMPLETE")
-        self.kpi_cases_left = KpiLabel(kpi_row, "CASES TO COMPLETE")
+        row2 = tk.Frame(self.tab_dash, bg="#000000")
+        row2.pack(fill="x", padx=30, pady=(0, 10))
 
-        for w in [self.kpi_trays, self.kpi_tpm, self.kpi_cases, self.kpi_cpm, self.kpi_trays_left, self.kpi_cases_left]:
-            w.pack(side="left", padx=18)
+        self.tray_completed = RatioBlock(row2, "RUN RATIO (TRAYS) - COMPLETED")
+        self.tray_remaining = RatioBlock(row2, "RUN RATIO (TRAYS) - REMAINING")
+        self.tray_completed.pack(side="left", padx=60)
+        self.tray_remaining.pack(side="left", padx=60)
 
-        # Estimated completion block
-        block = ttk.Frame(bg, style="Dash.TFrame")
-        block.pack(fill="x", padx=20, pady=20)
+        row3 = tk.Frame(self.tab_dash, bg="#000000")
+        row3.pack(fill="x", padx=30, pady=(10, 10))
 
-        ttl = ttk.Label(block, text="ESTIMATED TIME OF COMPLETION", style="DashTitle.TLabel")
-        ttl.pack(anchor="center", pady=(0, 10))
+        self.kpi_tpcases = KpiBlock(row3, "TP CASES")
+        self.kpi_casesmin = KpiBlock(row3, "CASES/MIN")
+        self.kpi_cases_to_complete = KpiBlock(row3, "CASES TO COMPLETE", value_color="#ff2b2b")
 
-        self.lbl_dash_est = ttk.Label(block, text="Run Production + Shortsheet to populate projections.", style="DashSmall.TLabel")
-        self.lbl_dash_est.pack(anchor="w", padx=10)
+        self.kpi_tpcases.pack(side="left", padx=40)
+        self.kpi_casesmin.pack(side="left", padx=40)
+        self.kpi_cases_to_complete.pack(side="right", padx=40)
 
-        # Big refresh button
-        btns = ttk.Frame(bg, style="Dash.TFrame")
-        btns.pack(fill="x", padx=20, pady=10)
+        row4 = tk.Frame(self.tab_dash, bg="#000000")
+        row4.pack(fill="x", padx=30, pady=(0, 10))
 
-        ttk.Button(btns, text="Refresh Dashboard (uses latest Shortsheet + Production)", command=self.refresh_dashboard).pack(
-            anchor="w"
-        )
+        self.case_completed = RatioBlock(row4, "CASE RATIO - COMPLETED")
+        self.case_remaining = RatioBlock(row4, "CASE RATIO - REMAINING")
+        self.case_completed.pack(side="left", padx=60)
+        self.case_remaining.pack(side="left", padx=60)
+
+        sep = tk.Frame(self.tab_dash, bg="#00ff00", height=2)
+        sep.pack(fill="x", padx=10, pady=(10, 10))
+
+        lbl = tk.Label(self.tab_dash, text="ESTIMATED TIME OF COMPLETION", bg="#000000", fg="#00ff00",
+                       font=("Segoe UI", 22, "bold"))
+        lbl.pack(pady=(0, 8))
+
+        self.lbl_estimates = tk.Label(self.tab_dash, text="Run Shortsheet + Production then Refresh Dashboard.",
+                                      bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold"), justify="left")
+        self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 10))
+
+        btn = tk.Button(self.tab_dash, text="REFRESH DASHBOARD", command=self.refresh_dashboard,
+                        bg="#101010", fg="#00ff00", activebackground="#202020", activeforeground="#00ff00",
+                        relief="solid", bd=1, font=("Segoe UI", 12, "bold"))
+        btn.pack(anchor="w", padx=60, pady=(0, 10))
 
         self.refresh_dashboard()
 
@@ -561,7 +598,6 @@ class App(tk.Tk):
         r = 0
         ttk.Label(frm, text="TxnDate (YYYY-MM-DD):").grid(row=r, column=0, sticky="w", **pad)
         ttk.Entry(frm, textvariable=self.var_txndate, width=16).grid(row=r, column=1, sticky="w", **pad)
-
         ttk.Checkbutton(frm, text="Only Remaining (>0)", variable=self.var_only_remaining).grid(row=r, column=2, sticky="w", **pad)
 
         r += 1
@@ -645,9 +681,6 @@ class App(tk.Tk):
             output_folder=self.var_output_folder.get().strip(),
         )
 
-    def _connect(self, cfg: AppConfig):
-        return pyodbc.connect(build_connection_string(cfg), timeout=25)
-
     def _parse_txndate(self) -> date:
         return datetime.strptime(self.var_txndate.get().strip(), "%Y-%m-%d").date()
 
@@ -716,79 +749,115 @@ class App(tk.Tk):
         else:
             messagebox.showerror("Connection", msg)
 
-    # ---------------- Dashboard refresh ----------------
+    # ---------------- Dashboard math ----------------
     def refresh_dashboard(self):
         now = datetime.now()
         self.lbl_dash_time.configure(text=now.strftime("%m/%d/%Y %H:%M"))
 
-        total_trays = 0.0
-        total_cases = 0.0
-        trays_left = 0.0
-        cases_left = 0.0
-        actual_tpm = 0.0
-        actual_cpm = 0.0
+        trays_completed_total = 0.0
+        cases_completed_total = 0.0
+        trays_completed_ossid = 0.0
+        trays_completed_repak = 0.0
+        cases_completed_ossid = 0.0
+        cases_completed_repak = 0.0
 
-        # production totals (from last refresh)
-        if self.last_production_df is not None and not self.last_production_df.empty:
-            total_trays = float(self.last_production_df["TraysProduced"].sum())
-            total_cases = float(self.last_production_df["CasesProduced"].sum())
+        trays_remaining_total = 0.0
+        cases_remaining_total = 0.0
+        trays_remaining_ossid = 0.0
+        trays_remaining_repak = 0.0
+        cases_remaining_ossid = 0.0
+        cases_remaining_repak = 0.0
 
-            try:
-                st = parse_hhmm(self.var_start_time.get())
-                start_dt = datetime.combine(now.date(), st)
-                minutes_ran = minutes_between(start_dt, now)
-                if minutes_ran > 0:
-                    actual_tpm = total_trays / minutes_ran
-                    actual_cpm = total_cases / minutes_ran
-            except Exception:
-                pass
+        # Completed from production
+        if self.last_production_full_df is not None and not self.last_production_full_df.empty:
+            p = self.last_production_full_df.copy()
+            trays_completed_total = float(p["TraysProduced"].sum())
+            cases_completed_total = float(p["CasesProduced"].sum())
 
-        # shortsheet remaining (from last run)
+            p["Machine"] = p["Machine"].astype(str).str.strip()
+            po = p[p["Machine"] == MACHINE_OSSID]
+            pr = p[p["Machine"] == MACHINE_REPAK]
+
+            trays_completed_ossid = float(po["TraysProduced"].sum()) if not po.empty else 0.0
+            trays_completed_repak = float(pr["TraysProduced"].sum()) if not pr.empty else 0.0
+            cases_completed_ossid = float(po["CasesProduced"].sum()) if not po.empty else 0.0
+            cases_completed_repak = float(pr["CasesProduced"].sum()) if not pr.empty else 0.0
+
+        # Remaining from shortsheet
         if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and self.master_df is not None and not self.master_df.empty:
             ss = self.last_shortsheets_df.copy()
             m = self.master_df.copy()
-            m["PLU"] = m["PLU"].astype(str).str.zfill(5)
             ss["PLU"] = ss["PLU"].astype(str).str.zfill(5)
-            ss = ss.merge(m[["PLU", "Trays"]], on="PLU", how="left")
+            m["PLU"] = m["PLU"].astype(str).str.zfill(5)
+
+            ss = ss.merge(m[["PLU", "Trays", "Machine"]], on="PLU", how="left")
             ss["Trays"] = pd.to_numeric(ss["Trays"], errors="coerce").fillna(0).astype(float)
             ss["RemainingCases"] = pd.to_numeric(ss["RemainingCases"], errors="coerce").fillna(0).astype(float)
-            cases_left = float(ss["RemainingCases"].sum())
-            trays_left = float((ss["RemainingCases"] * ss["Trays"]).sum())
+            ss["Machine"] = ss["Machine"].fillna("Unknown").astype(str).str.strip()
 
-        self.kpi_trays.set_value(f"{total_trays:,.0f}")
-        self.kpi_tpm.set_value(f"{actual_tpm:,.2f}" if actual_tpm > 0 else "—")
-        self.kpi_cases.set_value(f"{total_cases:,.0f}")
-        self.kpi_cpm.set_value(f"{actual_cpm:,.2f}" if actual_cpm > 0 else "—")
-        self.kpi_trays_left.set_value(f"{trays_left:,.0f}" if trays_left > 0 else "—")
-        self.kpi_cases_left.set_value(f"{cases_left:,.0f}" if cases_left > 0 else "—")
+            ss["TraysRemaining"] = ss["RemainingCases"] * ss["Trays"]
 
-        # Estimate finish text (uses actual & standard)
-        msg = []
-        if trays_left > 0 and actual_tpm > 0:
-            est_min = trays_left / actual_tpm
+            trays_remaining_total = float(ss["TraysRemaining"].sum())
+            cases_remaining_total = float(ss["RemainingCases"].sum())
+
+            so = ss[ss["Machine"] == MACHINE_OSSID]
+            sr = ss[ss["Machine"] == MACHINE_REPAK]
+
+            trays_remaining_ossid = float(so["TraysRemaining"].sum()) if not so.empty else 0.0
+            trays_remaining_repak = float(sr["TraysRemaining"].sum()) if not sr.empty else 0.0
+            cases_remaining_ossid = float(so["RemainingCases"].sum()) if not so.empty else 0.0
+            cases_remaining_repak = float(sr["RemainingCases"].sum()) if not sr.empty else 0.0
+
+        trays_per_min = 0.0
+        cases_per_min = 0.0
+        try:
+            st = parse_hhmm(self.var_start_time.get())
+            start_dt = datetime.combine(now.date(), st)
+            mins = minutes_between(start_dt, now)
+            if mins > 0:
+                trays_per_min = trays_completed_total / mins
+                cases_per_min = cases_completed_total / mins
+        except Exception:
+            pass
+
+        self.kpi_traypack.set_value(f"{trays_completed_total:,.0f}" if trays_completed_total > 0 else "—")
+        self.kpi_traysmin.set_value(f"{trays_per_min:,.2f}" if trays_per_min > 0 else "—")
+        self.kpi_tpcases.set_value(f"{cases_completed_total:,.0f}" if cases_completed_total > 0 else "—")
+        self.kpi_casesmin.set_value(f"{cases_per_min:,.2f}" if cases_per_min > 0 else "—")
+
+        self.kpi_trays_to_complete.set_value(f"{trays_remaining_total:,.0f}" if trays_remaining_total > 0 else "—")
+        self.kpi_cases_to_complete.set_value(f"{cases_remaining_total:,.0f}" if cases_remaining_total > 0 else "—")
+
+        self.tray_completed.set_values(f"{trays_completed_ossid:,.0f}", f"{trays_completed_repak:,.0f}")
+        self.tray_remaining.set_values(f"{trays_remaining_ossid:,.0f}", f"{trays_remaining_repak:,.0f}")
+        self.case_completed.set_values(f"{cases_completed_ossid:,.0f}", f"{cases_completed_repak:,.0f}")
+        self.case_remaining.set_values(f"{cases_remaining_ossid:,.0f}", f"{cases_remaining_repak:,.0f}")
+
+        lines = []
+        if trays_remaining_total > 0 and trays_per_min > 0:
+            est_min = trays_remaining_total / trays_per_min
             finish = now + timedelta(minutes=est_min)
-            msg.append(f"Based on Actual TPM: {actual_tpm:,.2f}  ->  Est. minutes left: {est_min:,.1f}  |  Finish: {finish.strftime('%H:%M')}")
+            lines.append(f"Based on DAYS AVERAGE (Actual) -> {trays_per_min:,.2f} trays/min | Est: {est_min/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}")
         else:
-            msg.append("Based on Actual TPM: (run Production + Shortsheet to calculate)")
+            lines.append("Based on DAYS AVERAGE (Actual) -> (run Production + Shortsheet)")
 
-        # Standard estimate (weighted)
-        if trays_left > 0 and self.last_production_df is not None and not self.last_production_df.empty:
-            df = self.last_production_df.copy()
-            total_trays_prod = float(df["TraysProduced"].sum())
+        if self.last_production_full_df is not None and not self.last_production_full_df.empty and trays_remaining_total > 0:
+            p = self.last_production_full_df.copy()
+            total_trays_prod = float(p["TraysProduced"].sum())
             std_weighted = 0.0
             if total_trays_prod > 0:
-                std_weighted = float((df["StdTPM"] * df["TraysProduced"]).sum() / total_trays_prod)
+                std_weighted = float((p["StdTPM"] * p["TraysProduced"]).sum() / total_trays_prod)
 
             if std_weighted > 0:
-                std_min = trays_left / std_weighted
+                std_min = trays_remaining_total / std_weighted
                 std_finish = now + timedelta(minutes=std_min)
-                msg.append(f"Based on Standards (weighted): {std_weighted:,.2f}  ->  Est. minutes left: {std_min:,.1f}  |  Finish: {std_finish.strftime('%H:%M')}")
+                lines.append(f"Based on STANDARDS -> {std_weighted:,.2f} trays/min | Est: {std_min/60:,.2f} hrs | Finish: {std_finish.strftime('%H:%M')}")
             else:
-                msg.append("Based on Standards: StdTPM missing/0 in Product Info")
+                lines.append("Based on STANDARDS -> StdTPM missing/0 in Product Info")
         else:
-            msg.append("Based on Standards: (run Production + Shortsheet to calculate)")
+            lines.append("Based on STANDARDS -> (run Production + Shortsheet)")
 
-        self.lbl_dash_est.configure(text="\n".join(msg))
+        self.lbl_estimates.configure(text="\n".join(lines))
 
     # ---------------- Shortsheet actions ----------------
     def on_run_shortsheets(self):
@@ -807,11 +876,12 @@ class App(tk.Tk):
         statuses = self._get_short_wip_statuses()
         only_remaining = bool(self.var_only_remaining.get())
         exclude_missing = bool(self.var_exclude_missing.get())
+        exclude_frozen = bool(self.var_exclude_frozen.get())
 
         try:
             cfg = self._collect_config()
             self._log("Connecting to SQL Server (shortsheet)...")
-            with self._connect(cfg) as conn:
+            with pyodbc.connect(build_connection_string(cfg), timeout=25) as conn:
                 df = fetch_shortsheets(conn, txnd, statuses, only_remaining)
 
             if df.empty:
@@ -826,25 +896,27 @@ class App(tk.Tk):
             if self.master_df is not None and not self.master_df.empty:
                 m = self.master_df.copy()
                 df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
-                df2 = df2.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine"]], on="PLU", how="left")
-                df2 = df2.rename(columns={
-                    "DESC": "ProductDescription",
-                    "Trays": "TraysPerCase",
-                    "TPM": "StdTPM"
-                })
+                df2 = df2.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]], on="PLU", how="left")
+                df2 = df2.rename(columns={"DESC": "ProductDescription", "Trays": "TraysPerCase", "TPM": "StdTPM"})
             else:
                 df2["ProductDescription"] = ""
-                df2["TraysPerCase"] = 0
+                df2["TraysPerCase"] = None
                 df2["StdTPM"] = 0
+                df2["Frozen"] = ""
 
-            # Exclude missing items (not in product info)
-            if exclude_missing and (self.master_df is not None) and (not self.master_df.empty):
-                # If it didn't merge, TraysPerCase will be NaN
+            if exclude_missing and self.master_df is not None and not self.master_df.empty:
                 df2["TraysPerCase"] = pd.to_numeric(df2["TraysPerCase"], errors="coerce")
                 before = len(df2)
                 df2 = df2[df2["TraysPerCase"].notna()].copy()
                 after = len(df2)
                 self._log(f"Exclude missing Product Info: removed {before - after} rows")
+
+            if exclude_frozen:
+                before = len(df2)
+                df2["Frozen"] = df2["Frozen"].astype(str).str.strip().str.upper()
+                df2 = df2[df2["Frozen"] != "Y"].copy()
+                after = len(df2)
+                self._log(f"Exclude Frozen=Y: removed {before - after} rows")
 
             show_cols = ["ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
             for c in show_cols:
@@ -855,7 +927,6 @@ class App(tk.Tk):
             self.last_shortsheets_df = df2
             self.short_table.set_dataframe(df2)
             self._log(f"Shortsheet rows: {len(df2):,}")
-
             self.refresh_dashboard()
         except Exception as e:
             self._log(f"ERROR shortsheet: {e}")
@@ -892,7 +963,7 @@ class App(tk.Tk):
 
         self._load_master(initial=True)
         if self.master_df is None or self.master_df.empty:
-            messagebox.showerror("Product Master", "Load Product Info.xlsx first (needed for Machine filter + trays + TPM).")
+            messagebox.showerror("Product Master", "Load Product Info.xlsx first.")
             return
 
         pack = (self.var_packdate.get() or "").strip()
@@ -903,8 +974,8 @@ class App(tk.Tk):
         pack_param = int(pack) if pack.isdigit() else pack
         machine_filter = (self.var_machine.get() or "All").strip()
         exclude_missing = bool(self.var_exclude_missing.get())
+        exclude_frozen = bool(self.var_exclude_frozen.get())
 
-        # times
         try:
             st = parse_hhmm(self.var_start_time.get())
             et = parse_hhmm(self.var_end_time.get())
@@ -913,9 +984,8 @@ class App(tk.Tk):
             return
 
         now = datetime.now()
-        today = now.date()
-        start_dt = datetime.combine(today, st)
-        end_dt = datetime.combine(today, et)
+        start_dt = datetime.combine(now.date(), st)
+        end_dt = datetime.combine(now.date(), et)
         if end_dt <= start_dt:
             end_dt = end_dt + timedelta(days=1)
 
@@ -925,23 +995,21 @@ class App(tk.Tk):
         try:
             cfg = self._collect_config()
             self._log("Connecting to SQL Server (production)...")
-            with self._connect(cfg) as conn:
+            with pyodbc.connect(build_connection_string(cfg), timeout=25) as conn:
                 prod_df = fetch_production_by_packdate(conn, pack_param, self.production_statuses)
 
             if prod_df.empty:
                 self._log("Production query returned 0 rows.")
-                self.last_production_df = pd.DataFrame()
-                self.last_primal_df = pd.DataFrame()
+                self.last_production_full_df = pd.DataFrame()
                 self.prod_table.set_dataframe(pd.DataFrame(columns=self.prod_table.columns))
                 self.primal_table.set_dataframe(pd.DataFrame(columns=self.primal_table.columns))
                 self.refresh_dashboard()
                 messagebox.showinfo("Production", "No production found for that packdate/status set.")
                 return
 
-            # merge to master
             m = self.master_df.copy()
             prod_df["PLU"] = prod_df["PLU"].astype(str).str.zfill(5)
-            merged = prod_df.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine"]], on="PLU", how="left")
+            merged = prod_df.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]], on="PLU", how="left")
 
             merged = merged.rename(columns={"Trays": "TraysPerCase", "TPM": "StdTPM"})
             merged["TraysPerCase"] = pd.to_numeric(merged["TraysPerCase"], errors="coerce")
@@ -949,31 +1017,36 @@ class App(tk.Tk):
             merged["CasesProduced"] = pd.to_numeric(merged["CasesProduced"], errors="coerce").fillna(0).astype(float)
             merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
 
-            # Exclude missing items
             if exclude_missing:
                 before = len(merged)
                 merged = merged[merged["TraysPerCase"].notna()].copy()
                 after = len(merged)
                 self._log(f"Exclude missing Product Info: removed {before - after} rows")
 
-            merged["Machine"] = merged["Machine"].fillna("Unknown")
+            if exclude_frozen:
+                before = len(merged)
+                merged["Frozen"] = merged["Frozen"].astype(str).str.strip().str.upper()
+                merged = merged[merged["Frozen"] != "Y"].copy()
+                after = len(merged)
+                self._log(f"Exclude Frozen=Y: removed {before - after} rows")
+
+            merged["Machine"] = merged["Machine"].fillna("Unknown").astype(str).str.strip()
             merged["Type"] = merged["Type"].fillna("Unknown")
             merged["DESC"] = merged["DESC"].fillna("")
             merged["TraysPerCase"] = merged["TraysPerCase"].fillna(0).astype(float)
 
-            # Machine filter
             if machine_filter != "All":
                 merged = merged[merged["Machine"].astype(str).str.strip() == machine_filter].copy()
 
             merged["TraysProduced"] = merged["CasesProduced"] * merged["TraysPerCase"]
 
-            # Totals
+            self.last_production_full_df = merged.copy()
+
             total_cases = float(merged["CasesProduced"].sum())
             total_lbs = float(merged["LbsProduced"].sum())
             total_trays = float(merged["TraysProduced"].sum())
             actual_tpm = (total_trays / minutes_ran) if minutes_ran > 0 else 0.0
 
-            # Trays left from shortsheet
             trays_left = 0.0
             if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty:
                 ss = self.last_shortsheets_df.copy()
@@ -1004,11 +1077,6 @@ class App(tk.Tk):
                 TraysProduced=("TraysProduced", "sum"),
             ).sort_values(by=["Machine", "TraysProduced"], ascending=[True, False])
 
-            # Save for dashboard
-            self.last_production_df = merged_display.copy()
-            self.last_primal_df = primal.copy()
-
-            # Summary text
             self.prod_summary.delete("1.0", "end")
             lines = []
             lines.append(f"PackDate: {pack}   |   Machine: {machine_filter}")
@@ -1041,7 +1109,6 @@ class App(tk.Tk):
             self.primal_table.set_dataframe(primal)
 
             self._log(f"Production rows (PLU): {len(merged_display):,}")
-
             self.refresh_dashboard()
         except Exception as e:
             self._log(f"ERROR production: {e}")
@@ -1049,72 +1116,7 @@ class App(tk.Tk):
             messagebox.showerror("Production Error", str(e))
 
     def on_export_production(self):
-        if self.master_df is None or self.master_df.empty:
-            messagebox.showinfo("Export", "Load Product Info.xlsx first.")
-            return
-
-        pack = (self.var_packdate.get() or "").strip()
-        if not pack:
-            messagebox.showinfo("Export", "Enter PackDate and Refresh Production first.")
-            return
-
-        pack_param = int(pack) if pack.isdigit() else pack
-        machine_filter = (self.var_machine.get() or "All").strip()
-
-        try:
-            cfg = self._collect_config()
-            with self._connect(cfg) as conn:
-                prod_df = fetch_production_by_packdate(conn, pack_param, self.production_statuses)
-
-            if prod_df.empty:
-                messagebox.showinfo("Export", "No production rows to export.")
-                return
-
-            m = self.master_df.copy()
-            prod_df["PLU"] = prod_df["PLU"].astype(str).str.zfill(5)
-            merged = prod_df.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine"]], on="PLU", how="left")
-            merged = merged.rename(columns={"Trays": "TraysPerCase", "TPM": "StdTPM"})
-            merged["TraysPerCase"] = pd.to_numeric(merged["TraysPerCase"], errors="coerce")
-            merged["StdTPM"] = pd.to_numeric(merged["StdTPM"], errors="coerce").fillna(0).astype(float)
-            merged["CasesProduced"] = pd.to_numeric(merged["CasesProduced"], errors="coerce").fillna(0).astype(float)
-            merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
-
-            if self.var_exclude_missing.get():
-                merged = merged[merged["TraysPerCase"].notna()].copy()
-
-            merged["Machine"] = merged["Machine"].fillna("Unknown")
-            merged["Type"] = merged["Type"].fillna("Unknown")
-            merged["DESC"] = merged["DESC"].fillna("")
-            merged["TraysPerCase"] = merged["TraysPerCase"].fillna(0).astype(float)
-            merged["TraysProduced"] = merged["CasesProduced"] * merged["TraysPerCase"]
-
-            if machine_filter != "All":
-                merged = merged[merged["Machine"].astype(str).str.strip() == machine_filter].copy()
-
-            primal = merged.groupby(["Machine", "Type"], as_index=False).agg(
-                CasesProduced=("CasesProduced", "sum"),
-                LbsProduced=("LbsProduced", "sum"),
-                TraysProduced=("TraysProduced", "sum"),
-            )
-
-            out_folder = self.var_output_folder.get().strip() or os.getcwd()
-            os.makedirs(out_folder, exist_ok=True)
-            out_path = os.path.join(out_folder, f"Production_PackDate_{pack}_{machine_filter}.xlsx")
-
-            export_multi_to_excel({
-                "ProductionByPLU": merged[[
-                    "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
-                    "CasesProduced", "LbsProduced", "TraysProduced"
-                ]].sort_values(by=["Machine", "Type", "TraysProduced"], ascending=[True, True, False]),
-                "ProductionByType": primal.sort_values(by=["Machine", "TraysProduced"], ascending=[True, False]),
-            }, out_path)
-
-            self._log(f"Exported production: {out_path}")
-            messagebox.showinfo("Export", f"Saved:\n{out_path}")
-        except Exception as e:
-            self._log(f"ERROR exporting production: {e}")
-            self._log(traceback.format_exc())
-            messagebox.showerror("Export Error", str(e))
+        messagebox.showinfo("Export", "Export Production not included in this trimmed build. Tell me and I'll add it back.")
 
 
 def main():
