@@ -59,7 +59,6 @@ def list_odbc_drivers() -> list[str]:
         return []
     try:
         drivers = pyodbc.drivers()
-        # Prefer SQL Server drivers first
         preferred = []
         other = []
         for d in drivers:
@@ -103,20 +102,24 @@ def test_connection(cfg: AppConfig) -> tuple[bool, str]:
 
 
 def _escape_sql_literal(s: str) -> str:
-    # escape single quotes for SQL
     return s.replace("'", "''")
 
 
 def _build_in_list_sql(values: list[str]) -> str:
-    """
-    Returns:  'A','B','C'
-    Safe for our controlled checkbox values.
-    PyInstaller-safe (no f-string backslash issues).
-    """
     escaped = []
     for v in values:
         escaped.append("'" + _escape_sql_literal(v) + "'")
     return ", ".join(escaped)
+
+
+# Old-SQL-safe numeric-to-int expression
+def sql_int_expr(col_name: str) -> str:
+    """
+    Returns a SQL expression that yields INT or NULL without TRY_CONVERT.
+    Works on older SQL Server:
+      CASE WHEN ISNUMERIC(col)=1 THEN CAST(col AS INT) ELSE NULL END
+    """
+    return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS INT) ELSE NULL END)"
 
 
 # -----------------------------
@@ -129,40 +132,44 @@ def run_diagnostics(conn, schedule_date: date, so_date_field: str, statuses: lis
 
     status_sql = _build_in_list_sql(statuses if statuses else ["Available"])
 
+    d_plu = sql_int_expr("d.ItemRef_FullName")
+    s_plu = sql_int_expr("s.ProductNumber")
+    w_plu = sql_int_expr("w.plu")
+
     sql_counts = f"""
     WITH OrdersForDay AS (
         SELECT so.TxnID
         FROM WPL.dbo.GP_SalesOrder so
-        WHERE so.{so_date_field} >= CAST(? AS datetime2(0))
-          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
+        WHERE so.{so_date_field} >= CAST(? AS DATETIME)
+          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS DATETIME))
     ),
     OrderedAgg AS (
         SELECT
-            TRY_CONVERT(int, d.ItemRef_FullName) AS PLU_Int,
-            SUM(COALESCE(d.Quantity,0)) AS QtyOrdered
+            {d_plu} AS PLU_Int,
+            SUM(ISNULL(d.Quantity,0)) AS QtyOrdered
         FROM WPL.dbo.GP_SalesOrderLineDetail d
         JOIN OrdersForDay o ON o.TxnID = d.TxnIDKey
-        WHERE TRY_CONVERT(int, d.ItemRef_FullName) IS NOT NULL
-        GROUP BY TRY_CONVERT(int, d.ItemRef_FullName)
+        WHERE {d_plu} IS NOT NULL
+        GROUP BY {d_plu}
     ),
     ShippedAgg AS (
         SELECT
-            TRY_CONVERT(int, s.ProductNumber) AS PLU_Int,
-            SUM(COALESCE(s.QtyShipped,0)) AS QtyShipped
+            {s_plu} AS PLU_Int,
+            SUM(ISNULL(s.QtyShipped,0)) AS QtyShipped
         FROM WPL.dbo.Shipped s
         JOIN OrdersForDay o ON o.TxnID = s.OrderNum
-        WHERE TRY_CONVERT(int, s.ProductNumber) IS NOT NULL
-        GROUP BY TRY_CONVERT(int, s.ProductNumber)
+        WHERE {s_plu} IS NOT NULL
+        GROUP BY {s_plu}
     ),
     InvAgg AS (
         SELECT
-            TRY_CONVERT(int, w.plu) AS PLU_Int,
+            {w_plu} AS PLU_Int,
             COUNT(*) AS AvailableCases
         FROM WPL.dbo.Wip w
-        JOIN OrderedAgg oa ON oa.PLU_Int = TRY_CONVERT(int, w.plu)
+        JOIN OrderedAgg oa ON oa.PLU_Int = {w_plu}
         WHERE w.status IN ({status_sql})
-          AND TRY_CONVERT(int, w.plu) IS NOT NULL
-        GROUP BY TRY_CONVERT(int, w.plu)
+          AND {w_plu} IS NOT NULL
+        GROUP BY {w_plu}
     )
     SELECT
         (SELECT COUNT(*) FROM OrdersForDay) AS SO_Count,
@@ -177,8 +184,8 @@ def run_diagnostics(conn, schedule_date: date, so_date_field: str, statuses: lis
     sql_samples_so = f"""
     SELECT TOP 10 so.TxnID, so.{so_date_field} AS DateValue
     FROM WPL.dbo.GP_SalesOrder so
-    WHERE so.{so_date_field} >= CAST(? AS datetime2(0))
-      AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
+    WHERE so.{so_date_field} >= CAST(? AS DATETIME)
+      AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS DATETIME))
     ORDER BY so.TxnID;
     """
     so_sample = pd.read_sql(sql_samples_so, conn, params=params)
@@ -187,8 +194,8 @@ def run_diagnostics(conn, schedule_date: date, so_date_field: str, statuses: lis
     WITH OrdersForDay AS (
         SELECT so.TxnID
         FROM WPL.dbo.GP_SalesOrder so
-        WHERE so.{so_date_field} >= CAST(? AS datetime2(0))
-          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
+        WHERE so.{so_date_field} >= CAST(? AS DATETIME)
+          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS DATETIME))
     )
     SELECT TOP 10
         d.TxnIDKey,
@@ -229,49 +236,53 @@ def fetch_shortsheets(conn, schedule_date: date, so_date_field: str, statuses: l
 
     status_sql = _build_in_list_sql(statuses)
 
-    where_remaining = "WHERE (oa.QtyOrdered - COALESCE(sa.QtyShipped,0)) > 0" if only_remaining else ""
+    d_plu = sql_int_expr("d.ItemRef_FullName")
+    s_plu = sql_int_expr("s.ProductNumber")
+    w_plu = sql_int_expr("w.plu")
+
+    where_remaining = "WHERE (oa.QtyOrdered - ISNULL(sa.QtyShipped,0)) > 0" if only_remaining else ""
 
     sql = f"""
     WITH OrdersForDay AS (
         SELECT so.TxnID
         FROM WPL.dbo.GP_SalesOrder so
-        WHERE so.{so_date_field} >= CAST(? AS datetime2(0))
-          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS datetime2(0)))
+        WHERE so.{so_date_field} >= CAST(? AS DATETIME)
+          AND so.{so_date_field} <  DATEADD(day, 1, CAST(? AS DATETIME))
     ),
     OrderedAgg AS (
         SELECT
-            TRY_CONVERT(int, d.ItemRef_FullName) AS PLU_Int,
-            SUM(COALESCE(d.Quantity,0)) AS QtyOrdered
+            {d_plu} AS PLU_Int,
+            SUM(ISNULL(d.Quantity,0)) AS QtyOrdered
         FROM WPL.dbo.GP_SalesOrderLineDetail d
         JOIN OrdersForDay o ON o.TxnID = d.TxnIDKey
-        WHERE TRY_CONVERT(int, d.ItemRef_FullName) IS NOT NULL
-        GROUP BY TRY_CONVERT(int, d.ItemRef_FullName)
+        WHERE {d_plu} IS NOT NULL
+        GROUP BY {d_plu}
     ),
     ShippedAgg AS (
         SELECT
-            TRY_CONVERT(int, s.ProductNumber) AS PLU_Int,
-            SUM(COALESCE(s.QtyShipped,0)) AS QtyShipped
+            {s_plu} AS PLU_Int,
+            SUM(ISNULL(s.QtyShipped,0)) AS QtyShipped
         FROM WPL.dbo.Shipped s
         JOIN OrdersForDay o ON o.TxnID = s.OrderNum
-        WHERE TRY_CONVERT(int, s.ProductNumber) IS NOT NULL
-        GROUP BY TRY_CONVERT(int, s.ProductNumber)
+        WHERE {s_plu} IS NOT NULL
+        GROUP BY {s_plu}
     ),
     InvAgg AS (
         SELECT
-            TRY_CONVERT(int, w.plu) AS PLU_Int,
+            {w_plu} AS PLU_Int,
             COUNT(*) AS AvailableCases
         FROM WPL.dbo.Wip w
-        JOIN OrderedAgg oa ON oa.PLU_Int = TRY_CONVERT(int, w.plu)
+        JOIN OrderedAgg oa ON oa.PLU_Int = {w_plu}
         WHERE w.status IN ({status_sql})
-          AND TRY_CONVERT(int, w.plu) IS NOT NULL
-        GROUP BY TRY_CONVERT(int, w.plu)
+          AND {w_plu} IS NOT NULL
+        GROUP BY {w_plu}
     )
     SELECT
         oa.PLU_Int,
         oa.QtyOrdered,
-        COALESCE(sa.QtyShipped,0) AS QtyShipped,
-        COALESCE(ia.AvailableCases,0) AS AvailableCases,
-        (oa.QtyOrdered - COALESCE(sa.QtyShipped,0)) AS RemainingCases
+        ISNULL(sa.QtyShipped,0) AS QtyShipped,
+        ISNULL(ia.AvailableCases,0) AS AvailableCases,
+        (oa.QtyOrdered - ISNULL(sa.QtyShipped,0)) AS RemainingCases
     FROM OrderedAgg oa
     LEFT JOIN ShippedAgg sa ON sa.PLU_Int = oa.PLU_Int
     LEFT JOIN InvAgg ia ON ia.PLU_Int = oa.PLU_Int
@@ -285,6 +296,7 @@ def fetch_shortsheets(conn, schedule_date: date, so_date_field: str, statuses: l
     if df.empty:
         return df
 
+    # Format PLU as 5 digits
     df["PLU"] = df["PLU_Int"].astype(int).astype(str).str.zfill(5)
     df = df.drop(columns=["PLU_Int"])
     return df
@@ -371,7 +383,6 @@ class App(tk.Tk):
 
         self.cfg = load_config()
 
-        # Connection vars
         self.var_server = tk.StringVar(value=self.cfg.server)
         self.var_database = tk.StringVar(value=self.cfg.database)
         self.var_driver = tk.StringVar(value=self.cfg.driver)
@@ -379,16 +390,13 @@ class App(tk.Tk):
         self.var_user = tk.StringVar(value=self.cfg.username)
         self.var_pass = tk.StringVar(value=self.cfg.password)
 
-        # Product vars
         self.var_product_path = tk.StringVar(value=self.cfg.product_excel_path)
         self.var_product_sheet = tk.StringVar(value=self.cfg.product_sheet_name)
 
-        # Run vars
         self.var_schedule_date = tk.StringVar(value=date.today().isoformat())
         self.var_so_date_field = tk.StringVar(value="ShipDate")
         self.var_only_remaining = tk.BooleanVar(value=True)
 
-        # WIP statuses
         self.var_wip_available = tk.BooleanVar(value=True)
         self.var_wip_scanning = tk.BooleanVar(value=True)
         self.var_wip_waiting = tk.BooleanVar(value=True)
@@ -561,7 +569,6 @@ class App(tk.Tk):
         cfg = self._collect_config()
         statuses = self._get_status_list()
         so_field = self.var_so_date_field.get().strip()
-        only_remaining = bool(self.var_only_remaining.get())
 
         try:
             sched = self._parse_date()
@@ -580,7 +587,6 @@ class App(tk.Tk):
             self._log(f"  OrderedPLU_Count: {c.get('OrderedPLU_Count')}")
             self._log(f"  ShippedPLU_Count: {c.get('ShippedPLU_Count')}")
             self._log(f"  InvPLU_Count: {c.get('InvPLU_Count')}")
-            self._log(f"  OnlyRemaining setting: {only_remaining}")
 
             self._log("Sample SO TxnIDs:")
             for _, r in diag["so_sample"].iterrows():
@@ -617,7 +623,6 @@ class App(tk.Tk):
             messagebox.showerror("Invalid Date", "Enter date as YYYY-MM-DD.")
             return
 
-        # Load product master (optional)
         master_df = pd.DataFrame()
         try:
             master_df = load_product_master(cfg.product_excel_path, cfg.product_sheet_name)
@@ -625,7 +630,6 @@ class App(tk.Tk):
                 self._log(f"Loaded product master rows: {len(master_df):,}")
         except Exception as e:
             self._log(f"WARNING: product master load failed: {e}")
-            master_df = pd.DataFrame()
 
         try:
             self._log("Connecting to SQL Server...")
@@ -645,14 +649,12 @@ class App(tk.Tk):
             messagebox.showinfo("No Results", "No results. Try changing SO Date Field and run Diagnostics.")
             return
 
-        # Merge description (optional)
         try:
             if not master_df.empty:
                 df = merge_master(df, master_df)
         except Exception as e:
             self._log(f"WARNING: description merge failed: {e}")
 
-        # Export
         try:
             out_folder = cfg.output_folder or os.getcwd()
             os.makedirs(out_folder, exist_ok=True)
