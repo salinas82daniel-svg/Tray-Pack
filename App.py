@@ -109,12 +109,10 @@ def _escape_sql_literal(s: str) -> str:
 
 
 def _build_in_list_sql(values: list[str]) -> str:
-    # Safe for constants you control (checkbox values)
     return ", ".join("'" + _escape_sql_literal(v) + "'" for v in values)
 
 
 def sql_int_expr(col_name: str) -> str:
-    # Works on older SQL Server: ISNUMERIC + CAST
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS INT) ELSE NULL END)"
 
 
@@ -145,41 +143,17 @@ def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Expected columns (flexible): PLU, DESC, Trays, TPM, Machine, Type, Frozen
     if "PLU" in df.columns:
         df["PLU"] = df["PLU"].astype(str).str.strip().str.zfill(5)
     else:
         raise ValueError("Product master must contain a column named 'PLU'.")
 
-    if "DESC" in df.columns:
-        df["DESC"] = df["DESC"].astype(str).fillna("")
-    else:
-        df["DESC"] = ""
-
-    if "Trays" in df.columns:
-        df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float)
-    else:
-        df["Trays"] = 0.0
-
-    if "TPM" in df.columns:
-        df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float)
-    else:
-        df["TPM"] = 0.0
-
-    if "Machine" in df.columns:
-        df["Machine"] = df["Machine"].astype(str).str.strip()
-    else:
-        df["Machine"] = ""
-
-    if "Type" in df.columns:
-        df["Type"] = df["Type"].astype(str).str.strip()
-    else:
-        df["Type"] = ""
-
-    if "Frozen" in df.columns:
-        df["Frozen"] = df["Frozen"].astype(str).str.strip().str.upper()
-    else:
-        df["Frozen"] = ""
+    df["DESC"] = df["DESC"].astype(str).fillna("") if "DESC" in df.columns else ""
+    df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float) if "Trays" in df.columns else 0.0
+    df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float) if "TPM" in df.columns else 0.0
+    df["Machine"] = df["Machine"].astype(str).str.strip() if "Machine" in df.columns else ""
+    df["Type"] = df["Type"].astype(str).str.strip() if "Type" in df.columns else ""
+    df["Frozen"] = df["Frozen"].astype(str).str.strip().str.upper() if "Frozen" in df.columns else ""
 
     return df
 
@@ -410,6 +384,48 @@ class RatioBlock(tk.Frame):
 
 
 # -----------------------------
+# Scrollable frame helper
+# -----------------------------
+class ScrollableFrame(ttk.Frame):
+    """A scrollable container using a Canvas.
+    Works well for big dashboards: wheel scroll + scrollbar.
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+
+        self.vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner = ttk.Frame(self.canvas)
+        self.window_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # mousewheel
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Shift-MouseWheel>", self._on_mousewheel_h)
+
+    def _on_inner_configure(self, _event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        # Make inner frame match canvas width
+        self.canvas.itemconfigure(self.window_id, width=event.width)
+
+    def _on_mousewheel(self, event):
+        # Windows wheel is event.delta multiples of 120
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_mousewheel_h(self, event):
+        self.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+
+
+# -----------------------------
 # Main App
 # -----------------------------
 class App(tk.Tk):
@@ -463,67 +479,90 @@ class App(tk.Tk):
         self._log("Ready.")
         self._load_master(initial=True)
 
+        # Default: hide settings for clean view
+        self._set_settings_visible(False)
+
     # ---------------- UI ----------------
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
-        frm_top = ttk.LabelFrame(self, text="Connection + Files")
-        frm_top.pack(fill="x", **pad)
+        # Top bar with toggle
+        topbar = ttk.Frame(self)
+        topbar.pack(fill="x", padx=10, pady=(10, 0))
+
+        self.var_settings_visible = tk.BooleanVar(value=True)
+        self.btn_toggle = ttk.Button(topbar, text="Show Settings", command=self.toggle_settings)
+        self.btn_toggle.pack(side="left")
+
+        ttk.Label(topbar, text="   ").pack(side="left")
+        ttk.Label(topbar, text="(Use this to show/hide SQL + file options)", foreground="#666").pack(side="left")
+
+        # Settings panel (collapsible)
+        self.frm_settings = ttk.LabelFrame(self, text="Connection + Files")
+        self.frm_settings.pack(fill="x", padx=10, pady=6)
 
         r = 0
-        ttk.Label(frm_top, text="Server:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(frm_top, textvariable=self.var_server, width=32).grid(row=r, column=1, sticky="w", **pad)
+        ttk.Label(self.frm_settings, text="Server:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(self.frm_settings, textvariable=self.var_server, width=32).grid(row=r, column=1, sticky="w", **pad)
 
-        ttk.Label(frm_top, text="Database:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Entry(frm_top, textvariable=self.var_database, width=12).grid(row=r, column=3, sticky="w", **pad)
+        ttk.Label(self.frm_settings, text="Database:").grid(row=r, column=2, sticky="w", **pad)
+        ttk.Entry(self.frm_settings, textvariable=self.var_database, width=12).grid(row=r, column=3, sticky="w", **pad)
 
-        ttk.Label(frm_top, text="Driver:").grid(row=r, column=4, sticky="w", **pad)
+        ttk.Label(self.frm_settings, text="Driver:").grid(row=r, column=4, sticky="w", **pad)
         drivers = list_odbc_drivers()
-        self.cmb_driver = ttk.Combobox(frm_top, textvariable=self.var_driver, values=drivers, width=28)
+        self.cmb_driver = ttk.Combobox(self.frm_settings, textvariable=self.var_driver, values=drivers, width=28)
         self.cmb_driver.grid(row=r, column=5, sticky="w", **pad)
         if drivers and not self.var_driver.get():
             self.var_driver.set(drivers[0])
 
         r += 1
-        ttk.Label(frm_top, text="Auth:").grid(row=r, column=0, sticky="w", **pad)
-        self.cmb_auth = ttk.Combobox(frm_top, textvariable=self.var_auth, values=["windows", "sql"], width=10, state="readonly")
+        ttk.Label(self.frm_settings, text="Auth:").grid(row=r, column=0, sticky="w", **pad)
+        self.cmb_auth = ttk.Combobox(self.frm_settings, textvariable=self.var_auth, values=["windows", "sql"], width=10, state="readonly")
         self.cmb_auth.grid(row=r, column=1, sticky="w", **pad)
         self.cmb_auth.bind("<<ComboboxSelected>>", lambda e: self._refresh_auth_state())
 
-        ttk.Label(frm_top, text="User:").grid(row=r, column=2, sticky="w", **pad)
-        self.ent_user = ttk.Entry(frm_top, textvariable=self.var_user, width=20)
+        ttk.Label(self.frm_settings, text="User:").grid(row=r, column=2, sticky="w", **pad)
+        self.ent_user = ttk.Entry(self.frm_settings, textvariable=self.var_user, width=20)
         self.ent_user.grid(row=r, column=3, sticky="w", **pad)
 
-        ttk.Label(frm_top, text="Pass:").grid(row=r, column=4, sticky="w", **pad)
-        self.ent_pass = ttk.Entry(frm_top, textvariable=self.var_pass, width=18, show="*")
+        ttk.Label(self.frm_settings, text="Pass:").grid(row=r, column=4, sticky="w", **pad)
+        self.ent_pass = ttk.Entry(self.frm_settings, textvariable=self.var_pass, width=18, show="*")
         self.ent_pass.grid(row=r, column=5, sticky="w", **pad)
 
         r += 1
-        ttk.Label(frm_top, text="Product Excel:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(frm_top, textvariable=self.var_product_path, width=60).grid(row=r, column=1, columnspan=3, sticky="w", **pad)
-        ttk.Button(frm_top, text="Browse", command=self.on_browse_product).grid(row=r, column=4, sticky="w", **pad)
-        ttk.Button(frm_top, text="Load Master", command=self._load_master).grid(row=r, column=5, sticky="w", **pad)
+        ttk.Label(self.frm_settings, text="Product Excel:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(self.frm_settings, textvariable=self.var_product_path, width=60).grid(row=r, column=1, columnspan=3, sticky="w", **pad)
+        ttk.Button(self.frm_settings, text="Browse", command=self.on_browse_product).grid(row=r, column=4, sticky="w", **pad)
+        ttk.Button(self.frm_settings, text="Load Master", command=self._load_master).grid(row=r, column=5, sticky="w", **pad)
 
         r += 1
-        ttk.Label(frm_top, text="Output Folder:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(frm_top, textvariable=self.var_output_folder, width=60).grid(row=r, column=1, columnspan=3, sticky="w", **pad)
-        ttk.Button(frm_top, text="Browse", command=self.on_browse_output).grid(row=r, column=4, sticky="w", **pad)
-        ttk.Button(frm_top, text="Test Connection", command=self.on_test_connection).grid(row=r, column=5, sticky="w", **pad)
+        ttk.Label(self.frm_settings, text="Output Folder:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(self.frm_settings, textvariable=self.var_output_folder, width=60).grid(row=r, column=1, columnspan=3, sticky="w", **pad)
+        ttk.Button(self.frm_settings, text="Browse", command=self.on_browse_output).grid(row=r, column=4, sticky="w", **pad)
+        ttk.Button(self.frm_settings, text="Test Connection", command=self.on_test_connection).grid(row=r, column=5, sticky="w", **pad)
 
         r += 1
-        ttk.Checkbutton(frm_top, text="Exclude PLUs missing from Product Info.xlsx", variable=self.var_exclude_missing).grid(
+        ttk.Checkbutton(self.frm_settings, text="Exclude PLUs missing from Product Info.xlsx", variable=self.var_exclude_missing).grid(
             row=r, column=0, columnspan=3, sticky="w", **pad
         )
-        ttk.Checkbutton(frm_top, text="Exclude Frozen Items (Frozen = Y)", variable=self.var_exclude_frozen).grid(
+        ttk.Checkbutton(self.frm_settings, text="Exclude Frozen Items (Frozen = Y)", variable=self.var_exclude_frozen).grid(
             row=r, column=3, columnspan=2, sticky="w", **pad
         )
-        ttk.Button(frm_top, text="Save Settings", command=self.on_save_settings).grid(row=r, column=5, sticky="w", **pad)
+        ttk.Button(self.frm_settings, text="Save Settings", command=self.on_save_settings).grid(row=r, column=5, sticky="w", **pad)
 
         # Tabs
         self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, **pad)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.tab_dash = tk.Frame(self.nb, bg="#000000")
+        # Dashboard tab is scrollable
+        self.tab_dash = ttk.Frame(self.nb)
+        self.dash_scroll = ScrollableFrame(self.tab_dash)
+        self.dash_scroll.pack(fill="both", expand=True)
+
+        # Real dashboard content lives inside scrollable inner
+        self.dash_root = tk.Frame(self.dash_scroll.inner, bg="#000000")
+        self.dash_root.pack(fill="both", expand=True)
+
         self.tab_short = ttk.Frame(self.nb)
         self.tab_prod = ttk.Frame(self.nb)
 
@@ -537,15 +576,29 @@ class App(tk.Tk):
 
         # Log
         frm_log = ttk.LabelFrame(self, text="Log")
-        frm_log.pack(fill="both", expand=False, **pad)
-        self.txt_log = tk.Text(frm_log, height=10, wrap="word")
+        frm_log.pack(fill="both", expand=False, padx=10, pady=(0, 10))
+        self.txt_log = tk.Text(frm_log, height=8, wrap="word")
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=10)
 
+    def toggle_settings(self):
+        self._set_settings_visible(not self._settings_visible)
+
+    def _set_settings_visible(self, visible: bool):
+        self._settings_visible = visible
+        if visible:
+            self.frm_settings.pack(fill="x", padx=10, pady=6)
+            self.btn_toggle.configure(text="Hide Settings")
+        else:
+            self.frm_settings.pack_forget()
+            self.btn_toggle.configure(text="Show Settings")
+
     def _build_tab_dashboard(self):
-        self.lbl_dash_time = tk.Label(self.tab_dash, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 10, "bold"))
+        root = self.dash_root  # black background
+
+        self.lbl_dash_time = tk.Label(root, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 10, "bold"))
         self.lbl_dash_time.place(relx=0.98, rely=0.02, anchor="ne")
 
-        row1 = tk.Frame(self.tab_dash, bg="#000000")
+        row1 = tk.Frame(root, bg="#000000")
         row1.pack(fill="x", padx=30, pady=(25, 10))
 
         self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
@@ -556,7 +609,7 @@ class App(tk.Tk):
         self.kpi_traysmin.pack(side="left", padx=40)
         self.kpi_trays_to_complete.pack(side="right", padx=40)
 
-        row2 = tk.Frame(self.tab_dash, bg="#000000")
+        row2 = tk.Frame(root, bg="#000000")
         row2.pack(fill="x", padx=30, pady=(0, 10))
 
         self.tray_completed = RatioBlock(row2, "RUN RATIO (TRAYS) - COMPLETED")
@@ -564,7 +617,7 @@ class App(tk.Tk):
         self.tray_completed.pack(side="left", padx=60)
         self.tray_remaining.pack(side="left", padx=60)
 
-        row3 = tk.Frame(self.tab_dash, bg="#000000")
+        row3 = tk.Frame(root, bg="#000000")
         row3.pack(fill="x", padx=30, pady=(10, 10))
 
         self.kpi_tpcases = KpiBlock(row3, "TP CASES")
@@ -575,7 +628,7 @@ class App(tk.Tk):
         self.kpi_casesmin.pack(side="left", padx=40)
         self.kpi_cases_to_complete.pack(side="right", padx=40)
 
-        row4 = tk.Frame(self.tab_dash, bg="#000000")
+        row4 = tk.Frame(root, bg="#000000")
         row4.pack(fill="x", padx=30, pady=(0, 10))
 
         self.case_completed = RatioBlock(row4, "CASE RATIO - COMPLETED")
@@ -583,21 +636,26 @@ class App(tk.Tk):
         self.case_completed.pack(side="left", padx=60)
         self.case_remaining.pack(side="left", padx=60)
 
-        sep = tk.Frame(self.tab_dash, bg="#00ff00", height=2)
+        sep = tk.Frame(root, bg="#00ff00", height=2)
         sep.pack(fill="x", padx=10, pady=(10, 10))
 
-        lbl = tk.Label(self.tab_dash, text="ESTIMATED TIME OF COMPLETION", bg="#000000", fg="#00ff00",
+        lbl = tk.Label(root, text="ESTIMATED TIME OF COMPLETION", bg="#000000", fg="#00ff00",
                        font=("Segoe UI", 22, "bold"))
         lbl.pack(pady=(0, 8))
 
-        self.lbl_estimates = tk.Label(self.tab_dash, text="Run Shortsheet + Production then Refresh Dashboard.",
-                                      bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold"), justify="left")
+        self.lbl_estimates = tk.Label(root, text="Run Shortsheet + Production then Refresh Dashboard.",
+                                      bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold"),
+                                      justify="left")
         self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 10))
 
-        btn = tk.Button(self.tab_dash, text="REFRESH DASHBOARD", command=self.refresh_dashboard,
+        btn = tk.Button(root, text="REFRESH DASHBOARD", command=self.refresh_dashboard,
                         bg="#101010", fg="#00ff00", activebackground="#202020", activeforeground="#00ff00",
                         relief="solid", bd=1, font=("Segoe UI", 12, "bold"))
-        btn.pack(anchor="w", padx=60, pady=(0, 10))
+        btn.pack(anchor="w", padx=60, pady=(0, 20))
+
+        # Add some bottom space so scrolling feels normal
+        spacer = tk.Frame(root, bg="#000000", height=120)
+        spacer.pack(fill="x")
 
         self.refresh_dashboard()
 
@@ -667,7 +725,7 @@ class App(tk.Tk):
         ttk.Label(self.tab_prod, text="Production by Primal (Type)").pack(anchor="w", padx=10)
         self.primal_table.pack(fill="both", expand=True, padx=10, pady=6)
 
-    # -------------- common helpers --------------
+    # -------------- helpers --------------
     def _log(self, msg: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.txt_log.insert("end", f"[{ts}] {msg}\n")
@@ -735,7 +793,7 @@ class App(tk.Tk):
                 messagebox.showerror("Product Master Error", str(e))
             self.master_df = pd.DataFrame()
 
-    # -------------- buttons --------------
+    # -------------- settings buttons --------------
     def on_browse_product(self):
         path = filedialog.askopenfilename(
             title="Select Product Info Excel",
@@ -782,7 +840,6 @@ class App(tk.Tk):
         cases_remaining_ossid = 0.0
         cases_remaining_repak = 0.0
 
-        # Completed from production
         if self.last_production_df is not None and not self.last_production_df.empty:
             p = self.last_production_df.copy()
             trays_completed_total = float(p["TraysProduced"].sum())
@@ -795,7 +852,6 @@ class App(tk.Tk):
             cases_completed_ossid = float(po["CasesProduced"].sum()) if not po.empty else 0.0
             cases_completed_repak = float(pr["CasesProduced"].sum()) if not pr.empty else 0.0
 
-        # Remaining from shortsheet
         if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and self.master_df is not None and not self.master_df.empty:
             ss = self.last_shortsheets_df.copy()
             m = self.master_df.copy()
@@ -818,7 +874,6 @@ class App(tk.Tk):
             cases_remaining_ossid = float(so["RemainingCases"].sum()) if not so.empty else 0.0
             cases_remaining_repak = float(sr["RemainingCases"].sum()) if not sr.empty else 0.0
 
-        # Minutes ran based on entered start time
         trays_per_min = 0.0
         cases_per_min = 0.0
         try:
@@ -852,7 +907,6 @@ class App(tk.Tk):
         else:
             lines.append("Based on ACTUAL -> (Run Production + Shortsheet)")
 
-        # Standards estimate (weighted)
         if self.last_production_df is not None and not self.last_production_df.empty and trays_remaining_total > 0:
             p = self.last_production_df.copy()
             total_trays_prod = float(p["TraysProduced"].sum())
@@ -906,7 +960,6 @@ class App(tk.Tk):
 
             df2 = df.copy()
 
-            # Merge product master for description
             if self.master_df is not None and not self.master_df.empty:
                 m = self.master_df.copy()
                 df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
@@ -918,7 +971,6 @@ class App(tk.Tk):
                 df2["StdTPM"] = 0
                 df2["Frozen"] = ""
 
-            # Exclude missing
             if exclude_missing and self.master_df is not None and not self.master_df.empty:
                 df2["TraysPerCase"] = pd.to_numeric(df2["TraysPerCase"], errors="coerce")
                 before = len(df2)
@@ -926,7 +978,6 @@ class App(tk.Tk):
                 after = len(df2)
                 self._log(f"Exclude missing Product Info: removed {before - after} rows")
 
-            # Exclude frozen
             if exclude_frozen:
                 before = len(df2)
                 df2["Frozen"] = df2["Frozen"].astype(str).str.strip().str.upper()
@@ -993,20 +1044,11 @@ class App(tk.Tk):
         exclude_frozen = bool(self.var_exclude_frozen.get())
 
         try:
-            st = parse_hhmm(self.var_start_time.get())
-            et = parse_hhmm(self.var_end_time.get())
+            parse_hhmm(self.var_start_time.get())
+            parse_hhmm(self.var_end_time.get())
         except Exception:
             messagebox.showerror("Time", "Enter Start/End time as HH:MM (24-hour), e.g., 08:30")
             return
-
-        now = datetime.now()
-        start_dt = datetime.combine(now.date(), st)
-        end_dt = datetime.combine(now.date(), et)
-        if end_dt <= start_dt:
-            end_dt = end_dt + timedelta(days=1)
-
-        minutes_ran = minutes_between(start_dt, now)
-        minutes_left_clock = max(0.0, minutes_between(now, end_dt))
 
         try:
             cfg = self._collect_config()
@@ -1034,17 +1076,11 @@ class App(tk.Tk):
             merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
 
             if exclude_missing:
-                before = len(merged)
                 merged = merged[merged["TraysPerCase"].notna()].copy()
-                after = len(merged)
-                self._log(f"Exclude missing Product Info: removed {before - after} rows")
 
             if exclude_frozen:
-                before = len(merged)
                 merged["Frozen"] = merged["Frozen"].astype(str).str.strip().str.upper()
                 merged = merged[merged["Frozen"] != "Y"].copy()
-                after = len(merged)
-                self._log(f"Exclude Frozen=Y: removed {before - after} rows")
 
             merged["Machine"] = merged["Machine"].fillna("Unknown").astype(str).str.strip()
             merged["Type"] = merged["Type"].fillna("Unknown")
@@ -1056,31 +1092,11 @@ class App(tk.Tk):
 
             merged["TraysProduced"] = merged["CasesProduced"] * merged["TraysPerCase"]
 
-            # Save for dashboard
             self.last_production_df = merged.copy()
 
             total_cases = float(merged["CasesProduced"].sum())
             total_lbs = float(merged["LbsProduced"].sum())
             total_trays = float(merged["TraysProduced"].sum())
-            actual_tpm = (total_trays / minutes_ran) if minutes_ran > 0 else 0.0
-
-            trays_left = 0.0
-            if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and self.master_df is not None and not self.master_df.empty:
-                ss = self.last_shortsheets_df.copy()
-                ss["PLU"] = ss["PLU"].astype(str).str.zfill(5)
-                ss2 = ss.merge(self.master_df[["PLU", "Trays"]], on="PLU", how="left")
-                ss2["Trays"] = pd.to_numeric(ss2["Trays"], errors="coerce").fillna(0).astype(float)
-                ss2["RemainingCases"] = pd.to_numeric(ss2["RemainingCases"], errors="coerce").fillna(0).astype(float)
-                trays_left = float((ss2["RemainingCases"] * ss2["Trays"]).sum())
-
-            est_minutes_left = (trays_left / actual_tpm) if actual_tpm > 0 else 0.0
-            projected_finish = (now + timedelta(minutes=est_minutes_left)) if actual_tpm > 0 else None
-
-            std_weighted_tpm = 0.0
-            if total_trays > 0:
-                std_weighted_tpm = float((merged["StdTPM"] * merged["TraysProduced"]).sum() / total_trays)
-            std_minutes_left = (trays_left / std_weighted_tpm) if std_weighted_tpm > 0 else 0.0
-            std_finish = (now + timedelta(minutes=std_minutes_left)) if std_weighted_tpm > 0 else None
 
             merged_display = merged[[
                 "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
@@ -1094,29 +1110,13 @@ class App(tk.Tk):
             ).sort_values(by=["Machine", "TraysProduced"], ascending=[True, False])
 
             self.prod_summary.delete("1.0", "end")
-            lines = []
-            lines.append(f"PackDate: {pack} | Machine filter: {machine_filter}")
-            lines.append(f"Statuses counted: {', '.join(self.production_statuses)}")
-            lines.append(f"Exclude Frozen=Y: {exclude_frozen} | Exclude Missing Master: {exclude_missing}")
-            lines.append("")
-            lines.append(f"TOTAL Produced -> Cases: {total_cases:,.0f} | Lbs: {total_lbs:,.1f} | Trays: {total_trays:,.0f}")
-            lines.append(f"Run -> Start: {start_dt.strftime('%H:%M')} | Now: {now.strftime('%H:%M')} | Minutes ran: {minutes_ran:,.1f}")
-            lines.append(f"Clock -> End: {end_dt.strftime('%H:%M')} | Minutes left (clock): {minutes_left_clock:,.1f}")
-            lines.append("")
-            lines.append(f"Actual TPM so far: {actual_tpm:,.2f}")
-            lines.append(f"Trays left to pack (from Shortsheet): {trays_left:,.0f}" if trays_left > 0 else "Trays left to pack: (Run Shortsheet to populate)")
-            if projected_finish is not None:
-                lines.append(f"Estimated minutes left (actual): {est_minutes_left:,.1f} | Projected finish: {projected_finish.strftime('%H:%M')}")
-            else:
-                lines.append("Estimated minutes left (actual): N/A (Actual TPM is 0)")
-            lines.append("")
-            lines.append(f"Standard TPM (weighted): {std_weighted_tpm:,.2f}")
-            if std_finish is not None:
-                lines.append(f"Estimated minutes left (standard): {std_minutes_left:,.1f} | Standard finish: {std_finish.strftime('%H:%M')}")
-            else:
-                lines.append("Estimated minutes left (standard): N/A (StdTPM is 0 or missing)")
-
-            self.prod_summary.insert("end", "\n".join(lines))
+            self.prod_summary.insert(
+                "end",
+                f"PackDate: {pack} | Machine filter: {machine_filter}\n"
+                f"Totals -> Cases: {total_cases:,.0f} | Lbs: {total_lbs:,.1f} | Trays: {total_trays:,.0f}\n"
+                f"Statuses: {', '.join(self.production_statuses)}\n"
+                f"Exclude Frozen=Y: {exclude_frozen} | Exclude Missing Master: {exclude_missing}\n"
+            )
 
             self.prod_table.set_dataframe(merged_display)
             self.primal_table.set_dataframe(primal)
@@ -1159,34 +1159,6 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"ERROR exporting production: {e}")
             messagebox.showerror("Export Error", str(e))
-
-    # ---------------- misc ----------------
-    def on_browse_product(self):
-        path = filedialog.askopenfilename(
-            title="Select Product Info Excel",
-            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
-        )
-        if path:
-            self.var_product_path.set(path)
-
-    def on_browse_output(self):
-        folder = filedialog.askdirectory(title="Select Output Folder")
-        if folder:
-            self.var_output_folder.set(folder)
-
-    def on_save_settings(self):
-        self.cfg = self._collect_config()
-        save_config(self.cfg)
-        self._log("Settings saved to config.json")
-
-    def on_test_connection(self):
-        cfg = self._collect_config()
-        ok, msg = test_connection(cfg)
-        self._log(msg)
-        if ok:
-            messagebox.showinfo("Connection", msg)
-        else:
-            messagebox.showerror("Connection", msg)
 
 
 def main():
