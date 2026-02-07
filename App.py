@@ -861,7 +861,7 @@ class App(tk.Tk):
 
         self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
         self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")
-        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COMPLETE", value_color="#ff2b2b")
+        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS Left", value_color="#ff2b2b")
         self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
         self.kpi_traypack.pack(side="left", padx=30)
