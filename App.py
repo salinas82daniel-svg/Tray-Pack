@@ -344,7 +344,7 @@ def fmt_duration_minutes(mins: float) -> str:
 
 
 # -----------------------------
-# UI helper: Treeview
+# UI helper: Treeview (scrollable)
 # -----------------------------
 class TableView(ttk.Frame):
     def __init__(self, parent, columns: list[str], height: int = 12):
@@ -365,6 +365,14 @@ class TableView(ttk.Frame):
         for c in columns:
             self.tree.heading(c, text=c)
             self.tree.column(c, width=140, anchor="w")
+
+        # Mousewheel support when pointer is over table
+        self.tree.bind("<Enter>", lambda e: self.tree.bind_all("<MouseWheel>", self._on_mousewheel))
+        self.tree.bind("<Leave>", lambda e: self.tree.unbind_all("<MouseWheel>"))
+
+    def _on_mousewheel(self, event):
+        # Windows: event.delta is 120 increments
+        self.tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def set_dataframe(self, df: pd.DataFrame):
         for item in self.tree.get_children():
@@ -711,6 +719,86 @@ class App(tk.Tk):
         self._load_master(initial=True)
         self._refresh_planned_listbox()
 
+    # -----------------------------
+    # Excel export helpers
+    # -----------------------------
+    def _choose_export_path(self, default_name: str) -> str:
+        folder = (self.cfg.output_folder or "").strip()
+        if folder and os.path.isdir(folder):
+            initialdir = folder
+        else:
+            initialdir = os.getcwd()
+
+        path = filedialog.asksaveasfilename(
+            title="Save Excel File",
+            initialdir=initialdir,
+            initialfile=default_name,
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx")]
+        )
+        return path or ""
+
+    def _export_df_to_excel(self, df: pd.DataFrame, path: str, sheet_name: str = "Data"):
+        if df is None or df.empty:
+            raise ValueError("Nothing to export (data is empty).")
+
+        out = df.copy()
+
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            out.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+
+        try:
+            self.cfg.output_folder = os.path.dirname(path)
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def on_export_shortsheets(self):
+        df = self.last_shortsheets_detail
+        if df is None or df.empty:
+            messagebox.showinfo("Export Shortsheet", "Run the shortsheet first (no data to export).")
+            return
+
+        from_d, to_d = self._parse_txn_from_to()
+        name = f"Shortsheet_{from_d.isoformat()}_to_{to_d.isoformat()}.xlsx"
+        path = self._choose_export_path(name)
+        if not path:
+            return
+        try:
+            self._export_df_to_excel(df, path, sheet_name="Shortsheet")
+            self._log(f"Exported shortsheet: {path}")
+            messagebox.showinfo("Export Shortsheet", "Export complete.")
+        except Exception as e:
+            self._log(f"ERROR exporting shortsheet: {e}")
+            messagebox.showerror("Export Shortsheet", str(e))
+
+    def on_export_production(self):
+        df = self.last_production_df
+        if df is None or df.empty:
+            messagebox.showinfo("Export Production", "Refresh Production first (no data to export).")
+            return
+
+        pack = (self.var_packdate.get() or "").strip() or "packdate"
+        name = f"Production_{pack}.xlsx"
+        path = self._choose_export_path(name)
+        if not path:
+            return
+        try:
+            export_cols = [
+                "Fed", "Machine", "Type", "ProductNumber", "PLU", "DESC",
+                "TraysPerCase", "StdTPM", "CasesProduced", "LbsProduced", "TraysProduced"
+            ]
+            out = df.copy()
+            export_cols = [c for c in export_cols if c in out.columns]
+            out = out[export_cols] if export_cols else out
+
+            self._export_df_to_excel(out, path, sheet_name="Production")
+            self._log(f"Exported production: {path}")
+            messagebox.showinfo("Export Production", "Export complete.")
+        except Exception as e:
+            self._log(f"ERROR exporting production: {e}")
+            messagebox.showerror("Export Production", str(e))
+
     # ------------- planned shorts persistence (range key) -------------
     def _parse_txn_from_to(self) -> tuple[date, date]:
         d1 = datetime.strptime(self.var_txn_from.get().strip(), "%Y-%m-%d").date()
@@ -909,13 +997,17 @@ class App(tk.Tk):
         row1.pack(fill="x", padx=30, pady=(15, 10))
 
         self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
-        self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")  # overall trays/min stays on main page
+        self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")  # overall trays/min
+        self.kpi_avg_ossid = KpiBlock(row1, "AVG TPM/LINE (O)")
+        self.kpi_avg_repak = KpiBlock(row1, "AVG TPM/LINE (R)")
         self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COMPLETE", value_color="#ff2b2b")
         self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
         self.kpi_traypack.pack(side="left", padx=30)
         self.kpi_traysmin.pack(side="left", padx=30)
-        tk.Frame(row1, bg="#000000", width=50).pack(side="left")
+        self.kpi_avg_ossid.pack(side="left", padx=30)
+        self.kpi_avg_repak.pack(side="left", padx=30)
+        tk.Frame(row1, bg="#000000", width=40).pack(side="left")
         self.kpi_planned.pack(side="right", padx=30)
         self.kpi_trays_to_complete.pack(side="right", padx=30)
 
@@ -970,20 +1062,9 @@ class App(tk.Tk):
         CategoryDashboard(self, f"{fed_value} Dashboard", compute)
 
     def compute_dashboard_payload(self, fed_filter: str | None = None) -> dict:
-        """
-        MAIN page (fed_filter None):
-          - keep overall trays/min KPI
-          - show trays/min by machine inside estimate block (OSSID + REPAK)
-          - show projected finish clock times (like before)
-
-        FED popups (fed_filter set):
-          - DO NOT show "finish at 14:32" (because we may not run that category continuously)
-          - Instead show only: "Hours needed at current overall rate" + "Hours needed at standard"
-          - (still broken down by machine, using OVERALL machine rates)
-        """
         now = datetime.now()
 
-        # --- Compute run mins from manual start time ---
+        # --- Run mins from manual start time ---
         run_mins = 0.0
         start_dt = None
         end_dt = None
@@ -996,7 +1077,10 @@ class App(tk.Tk):
         except Exception:
             run_mins = 0.0
 
-        # --- Production totals (overall and optionally category-filtered for "completed" KPIs) ---
+        ossid_lines = max(1, int(self.var_ossid_lines.get() or 1))
+        repak_lines = max(1, int(self.var_repak_lines.get() or 1))
+
+        # --- Production totals ---
         prod_df = self.last_production_df
 
         trays_completed_total = 0.0
@@ -1037,6 +1121,9 @@ class App(tk.Tk):
         trays_per_min_all = (trays_completed_total_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_ossid_all = (trays_completed_ossid_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_repak_all = (trays_completed_repak_all / run_mins) if run_mins > 0 else 0.0
+
+        avg_tpm_line_o = (trays_per_min_ossid_all / ossid_lines) if trays_per_min_ossid_all > 0 else 0.0
+        avg_tpm_line_r = (trays_per_min_repak_all / repak_lines) if trays_per_min_repak_all > 0 else 0.0
 
         trays_per_min_display = (trays_completed_total / run_mins) if run_mins > 0 else 0.0
         cases_per_min_display = (cases_completed_total / run_mins) if run_mins > 0 else 0.0
@@ -1097,22 +1184,22 @@ class App(tk.Tk):
 
             remain_for_std = ss_calc[["Machine", "TraysRemaining", "StdTPM"]].copy()
 
-        # --- Standard minutes (by machine + total) ---
+        # --- Standard minutes ---
         std = self.compute_standard_minutes(remain_for_std)
         std_ossid_min = std["ossid"]
         std_repak_min = std["repak"]
         std_total_min = std["total"]
 
-        # --- Build estimates (REVERT STYLE FOR MAIN; HOURS-ONLY FOR FED) ---
+        # --- Build estimates ---
         lines = []
         warn_lines = []
 
         if fed_filter:
-            # FED POPUP: show "hours needed" only
-            lines.append(f"Rate basis: OVERALL performance (not category-specific)")
+            # FED POPUP: hours-needed only (not a clock finish time)
+            lines.append("Rate basis: OVERALL performance (not category-specific)")
             lines.append("")
-            lines.append(f"CURRENT RATE (OSSID): {trays_per_min_ossid_all:,.2f} trays/min")
-            lines.append(f"CURRENT RATE (REPAK): {trays_per_min_repak_all:,.2f} trays/min")
+            lines.append(f"CURRENT RATE (OSSID): {trays_per_min_ossid_all:,.2f} trays/min  |  Avg/line: {avg_tpm_line_o:,.2f}")
+            lines.append(f"CURRENT RATE (REPAK): {trays_per_min_repak_all:,.2f} trays/min  |  Avg/line: {avg_tpm_line_r:,.2f}")
             lines.append(f"CURRENT RATE (TOTAL): {trays_per_min_all:,.2f} trays/min")
             lines.append("")
 
@@ -1133,11 +1220,14 @@ class App(tk.Tk):
             lines.append(f"TOTAL standard time: {fmt_duration_minutes(std_total_min)}")
 
         else:
-            # MAIN PAGE: show finish times + include trays/min by machine (the “fun stuff”)
+            # MAIN PAGE: finish clock times + standard time
             end_txt = end_dt.strftime("%H:%M") if end_dt else "—"
             start_txt = start_dt.strftime("%H:%M") if start_dt else "—"
             lines.append(f"Start: {start_txt} | End: {end_txt} | Run mins so far: {run_mins:,.0f}")
-            lines.append(f"Trays/min (TOTAL): {trays_per_min_all:,.2f} | OSSID: {trays_per_min_ossid_all:,.2f} | REPAK: {trays_per_min_repak_all:,.2f}")
+            lines.append(
+                f"Trays/min (TOTAL): {trays_per_min_all:,.2f} | OSSID: {trays_per_min_ossid_all:,.2f} | REPAK: {trays_per_min_repak_all:,.2f}"
+            )
+            lines.append(f"Avg TPM/line -> OSSID: {avg_tpm_line_o:,.2f} ({ossid_lines} lines) | REPAK: {avg_tpm_line_r:,.2f} ({repak_lines} lines)")
             lines.append("")
 
             def fmt_finish(machine_name: str, rem_trays: float, rate: float, std_min: float):
@@ -1185,6 +1275,8 @@ class App(tk.Tk):
         return {
             "tray_pack": fmt_kpi(trays_completed_total, 0),
             "trays_min": fmt_kpi(trays_per_min_all, 2) if trays_per_min_all > 0 else "—",
+            "avg_line_o": fmt_kpi(avg_tpm_line_o, 2) if avg_tpm_line_o > 0 else "—",
+            "avg_line_r": fmt_kpi(avg_tpm_line_r, 2) if avg_tpm_line_r > 0 else "—",
             "trays_to_complete": fmt_kpi(trays_remaining_total, 0),
             "planned": planned_txt,
             "trays_done_o": fmt_kpi(trays_completed_ossid, 0),
@@ -1210,7 +1302,9 @@ class App(tk.Tk):
             return
 
         self.kpi_traypack.set_value(payload["tray_pack"])
-        self.kpi_traysmin.set_value(payload["trays_min"])  # stays on main
+        self.kpi_traysmin.set_value(payload["trays_min"])
+        self.kpi_avg_ossid.set_value(payload.get("avg_line_o", "—"))
+        self.kpi_avg_repak.set_value(payload.get("avg_line_r", "—"))
         self.kpi_trays_to_complete.set_value(payload["trays_to_complete"])
         self.kpi_planned.set_value(payload["planned"])
 
@@ -1488,6 +1582,7 @@ class App(tk.Tk):
 
         r += 1
         ttk.Button(frm, text="Run Shortsheet", command=self.on_run_shortsheets).grid(row=r, column=0, sticky="w", **pad)
+        ttk.Button(frm, text="Export Shortsheet", command=self.on_export_shortsheets).grid(row=r, column=1, sticky="w", **pad)
 
         planned = ttk.LabelFrame(self.tab_short, text="Planned Shorts (Exclude specific PLUs from totals/ETA)")
         planned.pack(fill="x", padx=10, pady=(0, 8))
@@ -1543,12 +1638,17 @@ class App(tk.Tk):
 
         r += 1
         ttk.Button(frm, text="Refresh Production", command=self.on_refresh_production).grid(row=r, column=0, sticky="w", **pad)
+        ttk.Button(frm, text="Export Production", command=self.on_export_production).grid(row=r, column=1, sticky="w", **pad)
 
         self.prod_table = TableView(self.tab_prod, columns=[
             "Fed", "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
             "CasesProduced", "LbsProduced", "TraysProduced"
         ], height=18)
         self.prod_table.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def _build_tab_dashboard(self):
+        # implemented above (kept here for structure)
+        pass
 
 
 def main():
