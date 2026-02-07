@@ -306,6 +306,14 @@ def minutes_between(start: datetime, end: datetime) -> float:
     return max(0.0, (end - start).total_seconds() / 60.0)
 
 
+def _end_datetime_for_today(start_dt: datetime, end_t: time) -> datetime:
+    end_dt = datetime.combine(start_dt.date(), end_t)
+    # allow shift that crosses midnight
+    if end_dt < start_dt:
+        end_dt = end_dt + timedelta(days=1)
+    return end_dt
+
+
 # -----------------------------
 # UI helper: Treeview
 # -----------------------------
@@ -379,6 +387,33 @@ class RatioBlock(tk.Frame):
         self.repak = tk.Label(grid, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 16, "bold"))
         self.ossid.grid(row=1, column=0, padx=18)
         self.repak.grid(row=1, column=1, padx=18)
+
+    def set_values(self, ossid_val: str, repak_val: str):
+        self.ossid.configure(text=ossid_val)
+        self.repak.configure(text=repak_val)
+
+
+class DualRateBlock(tk.Frame):
+    """Small block to show machine-specific rate (e.g., trays/min)."""
+    def __init__(self, parent, title: str):
+        super().__init__(parent, bg="#000000", highlightbackground="#00ff00", highlightthickness=1)
+        tk.Label(self, text=title, bg="#000000", fg="#00ff00", font=("Segoe UI", 14, "bold")).pack(pady=(8, 6))
+
+        inner = tk.Frame(self, bg="#000000")
+        inner.pack(padx=16, pady=(0, 12))
+
+        left = tk.Frame(inner, bg="#000000")
+        right = tk.Frame(inner, bg="#000000")
+        left.grid(row=0, column=0, padx=22)
+        right.grid(row=0, column=1, padx=22)
+
+        tk.Label(left, text="OSSID", bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).pack()
+        self.ossid = tk.Label(left, text="—", bg="#000000", fg="#ff2b2b", font=("Segoe UI", 14, "bold"))
+        self.ossid.pack()
+
+        tk.Label(right, text="REPAK", bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).pack()
+        self.repak = tk.Label(right, text="—", bg="#000000", fg="#ff2b2b", font=("Segoe UI", 14, "bold"))
+        self.repak.pack()
 
     def set_values(self, ossid_val: str, repak_val: str):
         self.ossid.configure(text=ossid_val)
@@ -573,7 +608,6 @@ class App(tk.Tk):
         self.last_shortsheets_df: pd.DataFrame | None = None
         self.last_production_df: pd.DataFrame | None = None
 
-        # Options are stored in cfg now
         self.var_exclude_missing = tk.BooleanVar(value=self.cfg.exclude_missing_master)
         self.var_exclude_frozen = tk.BooleanVar(value=self.cfg.exclude_frozen_y)
 
@@ -597,7 +631,6 @@ class App(tk.Tk):
         self._load_master(initial=True)
 
     def _build_ui(self):
-        # Top bar
         topbar = ttk.Frame(self)
         topbar.pack(fill="x", padx=10, pady=(10, 6))
 
@@ -605,7 +638,6 @@ class App(tk.Tk):
         ttk.Label(topbar, text="   ").pack(side="left")
         ttk.Button(topbar, text="Refresh Dashboard", command=self.refresh_dashboard).pack(side="left")
 
-        # Tabs
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -627,7 +659,6 @@ class App(tk.Tk):
         self._build_tab_shortsheets()
         self._build_tab_production()
 
-        # Log
         frm_log = ttk.LabelFrame(self, text="Log")
         frm_log.pack(fill="both", expand=False, padx=10, pady=(0, 10))
         self.txt_log = tk.Text(frm_log, height=8, wrap="word")
@@ -637,7 +668,6 @@ class App(tk.Tk):
         SettingsWindow(self, self.cfg, self._apply_settings)
 
     def _apply_settings(self, cfg: AppConfig):
-        # called after Save
         self.cfg = cfg
         self.var_exclude_missing.set(cfg.exclude_missing_master)
         self.var_exclude_frozen.set(cfg.exclude_frozen_y)
@@ -708,6 +738,11 @@ class App(tk.Tk):
 
         self.kpi_traypack.pack(side="left", padx=40)
         self.kpi_traysmin.pack(side="left", padx=40)
+
+        # NEW: trays/min by machine (your red box area)
+        self.block_traysmin_by_machine = DualRateBlock(row1, "TRAYS/MIN BY MACHINE")
+        self.block_traysmin_by_machine.pack(side="left", padx=40)
+
         self.kpi_trays_to_complete.pack(side="right", padx=40)
 
         row2 = tk.Frame(root, bg="#000000")
@@ -747,7 +782,12 @@ class App(tk.Tk):
         self.lbl_estimates = tk.Label(root, text="Run Shortsheet + Production then Refresh Dashboard.",
                                       bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold"),
                                       justify="left")
-        self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 10))
+        self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 6))
+
+        # NEW: warning line (red when over end time)
+        self.lbl_warning = tk.Label(root, text="", bg="#000000", fg="#ff2b2b",
+                                    font=("Segoe UI", 12, "bold"), justify="left")
+        self.lbl_warning.pack(anchor="w", padx=60, pady=(0, 10))
 
         spacer = tk.Frame(root, bg="#000000", height=120)
         spacer.pack(fill="x")
@@ -758,19 +798,13 @@ class App(tk.Tk):
         now = datetime.now()
         self.lbl_dash_time.configure(text=now.strftime("%m/%d/%Y %H:%M"))
 
+        # ---------------- base totals from production ----------------
         trays_completed_total = 0.0
         cases_completed_total = 0.0
         trays_completed_ossid = 0.0
         trays_completed_repak = 0.0
         cases_completed_ossid = 0.0
         cases_completed_repak = 0.0
-
-        trays_remaining_total = 0.0
-        cases_remaining_total = 0.0
-        trays_remaining_ossid = 0.0
-        trays_remaining_repak = 0.0
-        cases_remaining_ossid = 0.0
-        cases_remaining_repak = 0.0
 
         if self.last_production_df is not None and not self.last_production_df.empty:
             p = self.last_production_df.copy()
@@ -779,21 +813,37 @@ class App(tk.Tk):
 
             po = p[p["Machine"].astype(str).str.strip() == MACHINE_OSSID]
             pr = p[p["Machine"].astype(str).str.strip() == MACHINE_REPAK]
+
             trays_completed_ossid = float(po["TraysProduced"].sum()) if not po.empty else 0.0
             trays_completed_repak = float(pr["TraysProduced"].sum()) if not pr.empty else 0.0
             cases_completed_ossid = float(po["CasesProduced"].sum()) if not po.empty else 0.0
             cases_completed_repak = float(pr["CasesProduced"].sum()) if not pr.empty else 0.0
 
-        if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and self.master_df is not None and not self.master_df.empty:
+        # ---------------- remaining from shortsheet ----------------
+        trays_remaining_total = 0.0
+        cases_remaining_total = 0.0
+        trays_remaining_ossid = 0.0
+        trays_remaining_repak = 0.0
+        cases_remaining_ossid = 0.0
+        cases_remaining_repak = 0.0
+
+        # also keep a per-PLU remaining frame for STANDARD estimates
+        remain_detail = None
+
+        if (self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and
+                self.master_df is not None and not self.master_df.empty):
             ss = self.last_shortsheets_df.copy()
             m = self.master_df.copy()
+
             ss["PLU"] = ss["PLU"].astype(str).str.zfill(5)
             m["PLU"] = m["PLU"].astype(str).str.zfill(5)
 
-            ss = ss.merge(m[["PLU", "Trays", "Machine"]], on="PLU", how="left")
+            ss = ss.merge(m[["PLU", "Trays", "Machine", "TPM"]], on="PLU", how="left")
             ss["Trays"] = pd.to_numeric(ss["Trays"], errors="coerce").fillna(0).astype(float)
+            ss["TPM"] = pd.to_numeric(ss["TPM"], errors="coerce").fillna(0).astype(float)
             ss["RemainingCases"] = pd.to_numeric(ss["RemainingCases"], errors="coerce").fillna(0).astype(float)
             ss["Machine"] = ss["Machine"].fillna("Unknown").astype(str).str.strip()
+
             ss["TraysRemaining"] = ss["RemainingCases"] * ss["Trays"]
 
             trays_remaining_total = float(ss["TraysRemaining"].sum())
@@ -801,43 +851,142 @@ class App(tk.Tk):
 
             so = ss[ss["Machine"] == MACHINE_OSSID]
             sr = ss[ss["Machine"] == MACHINE_REPAK]
+
             trays_remaining_ossid = float(so["TraysRemaining"].sum()) if not so.empty else 0.0
             trays_remaining_repak = float(sr["TraysRemaining"].sum()) if not sr.empty else 0.0
             cases_remaining_ossid = float(so["RemainingCases"].sum()) if not so.empty else 0.0
             cases_remaining_repak = float(sr["RemainingCases"].sum()) if not sr.empty else 0.0
 
-        trays_per_min = 0.0
+            remain_detail = ss.copy()
+
+        # ---------------- run minutes ----------------
+        run_mins = 0.0
+        start_dt = None
+        end_dt = None
         try:
             st = parse_hhmm(self.var_start_time.get())
+            et = parse_hhmm(self.var_end_time.get())
             start_dt = datetime.combine(now.date(), st)
-            mins = minutes_between(start_dt, now)
-            if mins > 0:
-                trays_per_min = trays_completed_total / mins
+            end_dt = _end_datetime_for_today(start_dt, et)
+            run_mins = minutes_between(start_dt, now)
         except Exception:
-            pass
+            run_mins = 0.0
 
+        # ---------------- ACTUAL rate overall + by machine ----------------
+        trays_per_min = (trays_completed_total / run_mins) if run_mins > 0 else 0.0
+        cases_per_min = (cases_completed_total / run_mins) if run_mins > 0 else 0.0
+
+        trays_per_min_ossid = (trays_completed_ossid / run_mins) if run_mins > 0 else 0.0
+        trays_per_min_repak = (trays_completed_repak / run_mins) if run_mins > 0 else 0.0
+
+        # ---------------- set top KPI blocks ----------------
         self.kpi_traypack.set_value(f"{trays_completed_total:,.0f}" if trays_completed_total > 0 else "—")
         self.kpi_traysmin.set_value(f"{trays_per_min:,.2f}" if trays_per_min > 0 else "—")
         self.kpi_tpcases.set_value(f"{cases_completed_total:,.0f}" if cases_completed_total > 0 else "—")
-        self.kpi_casesmin.set_value(f"{(cases_completed_total / max(1, mins)) if 'mins' in locals() and mins > 0 else 0:,.2f}" if ('mins' in locals() and mins > 0) else "—")
+        self.kpi_casesmin.set_value(f"{cases_per_min:,.2f}" if cases_per_min > 0 else "—")
 
         self.kpi_trays_to_complete.set_value(f"{trays_remaining_total:,.0f}" if trays_remaining_total > 0 else "—")
         self.kpi_cases_to_complete.set_value(f"{cases_remaining_total:,.0f}" if cases_remaining_total > 0 else "—")
 
+        self.block_traysmin_by_machine.set_values(
+            f"{trays_per_min_ossid:,.2f}" if trays_per_min_ossid > 0 else "—",
+            f"{trays_per_min_repak:,.2f}" if trays_per_min_repak > 0 else "—",
+        )
+
+        # ratios already exist
         self.tray_completed.set_values(f"{trays_completed_ossid:,.0f}", f"{trays_completed_repak:,.0f}")
         self.tray_remaining.set_values(f"{trays_remaining_ossid:,.0f}", f"{trays_remaining_repak:,.0f}")
         self.case_completed.set_values(f"{cases_completed_ossid:,.0f}", f"{cases_completed_repak:,.0f}")
         self.case_remaining.set_values(f"{cases_remaining_ossid:,.0f}", f"{cases_remaining_repak:,.0f}")
 
+        # ---------------- estimates text: ACTUAL + STANDARD by machine ----------------
         lines = []
+        warn_lines = []
+
+        # helper for a machine estimate
+        def _fmt_actual(machine_name: str, remain_trays: float, rate: float):
+            if remain_trays <= 0:
+                return f"{machine_name} ACTUAL -> No remaining trays."
+            if rate <= 0:
+                return f"{machine_name} ACTUAL -> Need production/run minutes to calculate rate."
+            mins = remain_trays / rate
+            finish = now + timedelta(minutes=mins)
+            return f"{machine_name} ACTUAL -> {rate:,.2f} trays/min | Est: {mins/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}"
+
+        lines.append(_fmt_actual("OSSID", trays_remaining_ossid, trays_per_min_ossid))
+        lines.append(_fmt_actual("REPAK", trays_remaining_repak, trays_per_min_repak))
+
+        # overall actual (optional but useful)
         if trays_remaining_total > 0 and trays_per_min > 0:
-            est_min = trays_remaining_total / trays_per_min
-            finish = now + timedelta(minutes=est_min)
-            lines.append(f"Based on ACTUAL -> {trays_per_min:,.2f} trays/min | Est: {est_min/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}")
+            mins = trays_remaining_total / trays_per_min
+            finish = now + timedelta(minutes=mins)
+            lines.append(f"TOTAL ACTUAL -> {trays_per_min:,.2f} trays/min | Est: {mins/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}")
         else:
-            lines.append("Based on ACTUAL -> (Run Production + Shortsheet)")
+            lines.append("TOTAL ACTUAL -> (Run Production + Shortsheet)")
+
+        # STANDARD (per-PLU sum of remaining_trays / StdTPM)
+        def _standard_minutes_for_machine(df: pd.DataFrame, machine_code: str) -> float:
+            d = df[df["Machine"].astype(str).str.strip() == machine_code].copy()
+            if d.empty:
+                return 0.0
+            # only PLUs with StdTPM > 0
+            d["TPM"] = pd.to_numeric(d["TPM"], errors="coerce").fillna(0).astype(float)
+            d["TraysRemaining"] = pd.to_numeric(d["TraysRemaining"], errors="coerce").fillna(0).astype(float)
+            d = d[(d["TPM"] > 0) & (d["TraysRemaining"] > 0)].copy()
+            if d.empty:
+                return 0.0
+            return float((d["TraysRemaining"] / d["TPM"]).sum())
+
+        if remain_detail is not None:
+            std_mins_o = _standard_minutes_for_machine(remain_detail, MACHINE_OSSID)
+            std_mins_r = _standard_minutes_for_machine(remain_detail, MACHINE_REPAK)
+            std_mins_total = std_mins_o + std_mins_r
+
+            if std_mins_o > 0:
+                finish_o = now + timedelta(minutes=std_mins_o)
+                lines.append(f"OSSID STANDARD -> Est: {std_mins_o/60:,.2f} hrs | Finish: {finish_o.strftime('%H:%M')}")
+            else:
+                lines.append("OSSID STANDARD -> StdTPM missing/0 for remaining Ossid items.")
+
+            if std_mins_r > 0:
+                finish_r = now + timedelta(minutes=std_mins_r)
+                lines.append(f"REPAK STANDARD -> Est: {std_mins_r/60:,.2f} hrs | Finish: {finish_r.strftime('%H:%M')}")
+            else:
+                lines.append("REPAK STANDARD -> StdTPM missing/0 for remaining Repak items.")
+
+            if std_mins_total > 0:
+                finish_t = now + timedelta(minutes=std_mins_total)
+                lines.append(f"TOTAL STANDARD -> Est: {std_mins_total/60:,.2f} hrs | Finish: {finish_t.strftime('%H:%M')}")
+            else:
+                lines.append("TOTAL STANDARD -> (Need StdTPM + remaining trays)")
+        else:
+            lines.append("STANDARD -> (Run Shortsheet + load Product Info with StdTPM)")
 
         self.lbl_estimates.configure(text="\n".join(lines))
+
+        # ---------------- warning vs end time ----------------
+        self.lbl_warning.configure(text="")
+        if start_dt is not None and end_dt is not None:
+            # Actual projections (by machine)
+            if trays_remaining_ossid > 0 and trays_per_min_ossid > 0:
+                finish_o = now + timedelta(minutes=(trays_remaining_ossid / trays_per_min_ossid))
+                if finish_o > end_dt:
+                    warn_lines.append(f"⚠ OSSID projected finish {finish_o.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
+
+            if trays_remaining_repak > 0 and trays_per_min_repak > 0:
+                finish_r = now + timedelta(minutes=(trays_remaining_repak / trays_per_min_repak))
+                if finish_r > end_dt:
+                    warn_lines.append(f"⚠ REPAK projected finish {finish_r.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
+
+            if trays_remaining_total > 0 and trays_per_min > 0:
+                finish_t = now + timedelta(minutes=(trays_remaining_total / trays_per_min))
+                if finish_t > end_dt:
+                    warn_lines.append(f"⚠ TOTAL projected finish {finish_t.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
+
+        if warn_lines:
+            self.lbl_warning.configure(text="\n".join(warn_lines))
+        else:
+            self.lbl_warning.configure(text="")
 
     # ---------------- Shortsheet ----------------
     def on_run_shortsheets(self):
