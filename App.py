@@ -17,7 +17,7 @@ except ImportError:
 APP_NAME = "ShortsheetBuilder"
 CONFIG_FILE = "config.json"
 
-# Your mapping
+# Machine mapping (your rule)
 MACHINE_OSSID = "O"
 MACHINE_REPAK = "R"
 
@@ -83,7 +83,6 @@ def build_connection_string(cfg: AppConfig) -> str:
         raise ValueError("Server Address is blank.")
 
     base = f"DRIVER={{{cfg.driver}}};SERVER={cfg.server};DATABASE={cfg.database};"
-
     if cfg.auth_mode == "windows":
         return base + "Trusted_Connection=yes;"
     else:
@@ -115,6 +114,7 @@ def _build_in_list_sql(values: list[str]) -> str:
 
 
 def sql_int_expr(col_name: str) -> str:
+    # Works on older SQL Server as well (no TRY_CONVERT)
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS INT) ELSE NULL END)"
 
 
@@ -145,14 +145,27 @@ def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    if "PLU" in df.columns:
-        df["PLU"] = df["PLU"].astype(str).str.strip().str.zfill(5)
-    else:
+    if "PLU" not in df.columns:
         raise ValueError("Product master must contain a column named 'PLU'.")
 
-    df["DESC"] = df["DESC"].astype(str).fillna("") if "DESC" in df.columns else ""
-    df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float) if "Trays" in df.columns else 0.0
-    df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float) if "TPM" in df.columns else 0.0
+    df["PLU"] = df["PLU"].astype(str).str.strip().str.zfill(5)
+
+    # Optional columns, normalized
+    if "DESC" in df.columns:
+        df["DESC"] = df["DESC"].astype(str).fillna("")
+    else:
+        df["DESC"] = ""
+
+    if "Trays" in df.columns:
+        df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float)
+    else:
+        df["Trays"] = 0.0
+
+    if "TPM" in df.columns:
+        df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float)
+    else:
+        df["TPM"] = 0.0
+
     df["Machine"] = df["Machine"].astype(str).str.strip() if "Machine" in df.columns else ""
     df["Type"] = df["Type"].astype(str).str.strip() if "Type" in df.columns else ""
     df["Frozen"] = df["Frozen"].astype(str).str.strip().str.upper() if "Frozen" in df.columns else ""
@@ -306,9 +319,8 @@ def minutes_between(start: datetime, end: datetime) -> float:
     return max(0.0, (end - start).total_seconds() / 60.0)
 
 
-def _end_datetime_for_today(start_dt: datetime, end_t: time) -> datetime:
+def end_datetime_for_today(start_dt: datetime, end_t: time) -> datetime:
     end_dt = datetime.combine(start_dt.date(), end_t)
-    # allow shift that crosses midnight
     if end_dt < start_dt:
         end_dt = end_dt + timedelta(days=1)
     return end_dt
@@ -394,9 +406,9 @@ class RatioBlock(tk.Frame):
 
 
 class DualRateBlock(tk.Frame):
-    """Small block to show machine-specific rate (e.g., trays/min)."""
+    """Small block to show machine-specific rate (e.g., trays/min). No outline."""
     def __init__(self, parent, title: str):
-        super().__init__(parent, bg="#000000", highlightbackground="#00ff00", highlightthickness=1)
+        super().__init__(parent, bg="#000000")
         tk.Label(self, text=title, bg="#000000", fg="#00ff00", font=("Segoe UI", 14, "bold")).pack(pady=(8, 6))
 
         inner = tk.Frame(self, bg="#000000")
@@ -408,11 +420,11 @@ class DualRateBlock(tk.Frame):
         right.grid(row=0, column=1, padx=22)
 
         tk.Label(left, text="OSSID", bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).pack()
-        self.ossid = tk.Label(left, text="—", bg="#000000", fg="#ff2b2b", font=("Segoe UI", 14, "bold"))
+        self.ossid = tk.Label(left, text="—", bg="#000000", fg="#ff2b2b", font=("Segoe UI", 12, "bold"))
         self.ossid.pack()
 
         tk.Label(right, text="REPAK", bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).pack()
-        self.repak = tk.Label(right, text="—", bg="#000000", fg="#ff2b2b", font=("Segoe UI", 14, "bold"))
+        self.repak = tk.Label(right, text="—", bg="#000000", fg="#ff2b2b", font=("Segoe UI", 12, "bold"))
         self.repak.pack()
 
     def set_values(self, ossid_val: str, repak_val: str):
@@ -608,9 +620,6 @@ class App(tk.Tk):
         self.last_shortsheets_df: pd.DataFrame | None = None
         self.last_production_df: pd.DataFrame | None = None
 
-        self.var_exclude_missing = tk.BooleanVar(value=self.cfg.exclude_missing_master)
-        self.var_exclude_frozen = tk.BooleanVar(value=self.cfg.exclude_frozen_y)
-
         # Shortsheet inputs
         self.var_txndate = tk.StringVar(value=date.today().isoformat())
         self.var_only_remaining = tk.BooleanVar(value=True)
@@ -623,6 +632,10 @@ class App(tk.Tk):
         self.var_machine = tk.StringVar(value="All")
         self.var_start_time = tk.StringVar(value="08:30")
         self.var_end_time = tk.StringVar(value="17:00")
+
+        # NEW: lines running
+        self.var_ossid_lines = tk.IntVar(value=6)
+        self.var_repak_lines = tk.IntVar(value=1)
 
         self.production_statuses = ["Available", "ScanningSalesOrder", "WaitingToBeInvoiced", "Shipped"]
 
@@ -669,8 +682,6 @@ class App(tk.Tk):
 
     def _apply_settings(self, cfg: AppConfig):
         self.cfg = cfg
-        self.var_exclude_missing.set(cfg.exclude_missing_master)
-        self.var_exclude_frozen.set(cfg.exclude_frozen_y)
         self._log("Settings applied.")
         self._load_master(initial=True)
 
@@ -739,9 +750,13 @@ class App(tk.Tk):
         self.kpi_traypack.pack(side="left", padx=40)
         self.kpi_traysmin.pack(side="left", padx=40)
 
-        # NEW: trays/min by machine (your red box area)
+        # shift/center with spacers
+        tk.Frame(row1, bg="#000000", width=80).pack(side="left")
+
         self.block_traysmin_by_machine = DualRateBlock(row1, "TRAYS/MIN BY MACHINE")
-        self.block_traysmin_by_machine.pack(side="left", padx=40)
+        self.block_traysmin_by_machine.pack(side="left", padx=10)
+
+        tk.Frame(row1, bg="#000000", width=80).pack(side="left")
 
         self.kpi_trays_to_complete.pack(side="right", padx=40)
 
@@ -784,7 +799,6 @@ class App(tk.Tk):
                                       justify="left")
         self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 6))
 
-        # NEW: warning line (red when over end time)
         self.lbl_warning = tk.Label(root, text="", bg="#000000", fg="#ff2b2b",
                                     font=("Segoe UI", 12, "bold"), justify="left")
         self.lbl_warning.pack(anchor="w", padx=60, pady=(0, 10))
@@ -798,7 +812,11 @@ class App(tk.Tk):
         now = datetime.now()
         self.lbl_dash_time.configure(text=now.strftime("%m/%d/%Y %H:%M"))
 
-        # ---------------- base totals from production ----------------
+        # Lines running (capacity adjustment)
+        ossid_lines = max(1, int(self.var_ossid_lines.get() or 1))
+        repak_lines = max(1, int(self.var_repak_lines.get() or 1))
+
+        # Completed totals (from production)
         trays_completed_total = 0.0
         cases_completed_total = 0.0
         trays_completed_ossid = 0.0
@@ -813,13 +831,12 @@ class App(tk.Tk):
 
             po = p[p["Machine"].astype(str).str.strip() == MACHINE_OSSID]
             pr = p[p["Machine"].astype(str).str.strip() == MACHINE_REPAK]
-
             trays_completed_ossid = float(po["TraysProduced"].sum()) if not po.empty else 0.0
             trays_completed_repak = float(pr["TraysProduced"].sum()) if not pr.empty else 0.0
             cases_completed_ossid = float(po["CasesProduced"].sum()) if not po.empty else 0.0
             cases_completed_repak = float(pr["CasesProduced"].sum()) if not pr.empty else 0.0
 
-        # ---------------- remaining from shortsheet ----------------
+        # Remaining totals (from shortsheet)
         trays_remaining_total = 0.0
         cases_remaining_total = 0.0
         trays_remaining_ossid = 0.0
@@ -827,14 +844,12 @@ class App(tk.Tk):
         cases_remaining_ossid = 0.0
         cases_remaining_repak = 0.0
 
-        # also keep a per-PLU remaining frame for STANDARD estimates
         remain_detail = None
 
         if (self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and
                 self.master_df is not None and not self.master_df.empty):
             ss = self.last_shortsheets_df.copy()
             m = self.master_df.copy()
-
             ss["PLU"] = ss["PLU"].astype(str).str.zfill(5)
             m["PLU"] = m["PLU"].astype(str).str.zfill(5)
 
@@ -859,7 +874,7 @@ class App(tk.Tk):
 
             remain_detail = ss.copy()
 
-        # ---------------- run minutes ----------------
+        # Run minutes (from start -> now)
         run_mins = 0.0
         start_dt = None
         end_dt = None
@@ -867,19 +882,21 @@ class App(tk.Tk):
             st = parse_hhmm(self.var_start_time.get())
             et = parse_hhmm(self.var_end_time.get())
             start_dt = datetime.combine(now.date(), st)
-            end_dt = _end_datetime_for_today(start_dt, et)
+            end_dt = end_datetime_for_today(start_dt, et)
             run_mins = minutes_between(start_dt, now)
         except Exception:
             run_mins = 0.0
 
-        # ---------------- ACTUAL rate overall + by machine ----------------
+        # ACTUAL rates
         trays_per_min = (trays_completed_total / run_mins) if run_mins > 0 else 0.0
         cases_per_min = (cases_completed_total / run_mins) if run_mins > 0 else 0.0
-
         trays_per_min_ossid = (trays_completed_ossid / run_mins) if run_mins > 0 else 0.0
         trays_per_min_repak = (trays_completed_repak / run_mins) if run_mins > 0 else 0.0
 
-        # ---------------- set top KPI blocks ----------------
+        trays_per_min_ossid_per_line = trays_per_min_ossid / ossid_lines if trays_per_min_ossid > 0 else 0.0
+        trays_per_min_repak_per_line = trays_per_min_repak / repak_lines if trays_per_min_repak > 0 else 0.0
+
+        # KPI display
         self.kpi_traypack.set_value(f"{trays_completed_total:,.0f}" if trays_completed_total > 0 else "—")
         self.kpi_traysmin.set_value(f"{trays_per_min:,.2f}" if trays_per_min > 0 else "—")
         self.kpi_tpcases.set_value(f"{cases_completed_total:,.0f}" if cases_completed_total > 0 else "—")
@@ -888,35 +905,36 @@ class App(tk.Tk):
         self.kpi_trays_to_complete.set_value(f"{trays_remaining_total:,.0f}" if trays_remaining_total > 0 else "—")
         self.kpi_cases_to_complete.set_value(f"{cases_remaining_total:,.0f}" if cases_remaining_total > 0 else "—")
 
-        self.block_traysmin_by_machine.set_values(
-            f"{trays_per_min_ossid:,.2f}" if trays_per_min_ossid > 0 else "—",
-            f"{trays_per_min_repak:,.2f}" if trays_per_min_repak > 0 else "—",
-        )
+        ossid_txt = "—"
+        repak_txt = "—"
+        if trays_per_min_ossid > 0:
+            ossid_txt = f"{trays_per_min_ossid:,.2f} | {trays_per_min_ossid_per_line:,.2f}/line"
+        if trays_per_min_repak > 0:
+            repak_txt = f"{trays_per_min_repak:,.2f} | {trays_per_min_repak_per_line:,.2f}/line"
+        self.block_traysmin_by_machine.set_values(ossid_txt, repak_txt)
 
-        # ratios already exist
+        # Ratio boxes
         self.tray_completed.set_values(f"{trays_completed_ossid:,.0f}", f"{trays_completed_repak:,.0f}")
         self.tray_remaining.set_values(f"{trays_remaining_ossid:,.0f}", f"{trays_remaining_repak:,.0f}")
         self.case_completed.set_values(f"{cases_completed_ossid:,.0f}", f"{cases_completed_repak:,.0f}")
         self.case_remaining.set_values(f"{cases_remaining_ossid:,.0f}", f"{cases_remaining_repak:,.0f}")
 
-        # ---------------- estimates text: ACTUAL + STANDARD by machine ----------------
+        # Estimates text
         lines = []
         warn_lines = []
 
-        # helper for a machine estimate
-        def _fmt_actual(machine_name: str, remain_trays: float, rate: float):
+        def fmt_actual(machine_name: str, remain_trays: float, rate_total: float):
             if remain_trays <= 0:
                 return f"{machine_name} ACTUAL -> No remaining trays."
-            if rate <= 0:
+            if rate_total <= 0:
                 return f"{machine_name} ACTUAL -> Need production/run minutes to calculate rate."
-            mins = remain_trays / rate
+            mins = remain_trays / rate_total
             finish = now + timedelta(minutes=mins)
-            return f"{machine_name} ACTUAL -> {rate:,.2f} trays/min | Est: {mins/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}"
+            return f"{machine_name} ACTUAL -> {rate_total:,.2f} trays/min | Est: {mins/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}"
 
-        lines.append(_fmt_actual("OSSID", trays_remaining_ossid, trays_per_min_ossid))
-        lines.append(_fmt_actual("REPAK", trays_remaining_repak, trays_per_min_repak))
+        lines.append(fmt_actual("OSSID", trays_remaining_ossid, trays_per_min_ossid))
+        lines.append(fmt_actual("REPAK", trays_remaining_repak, trays_per_min_repak))
 
-        # overall actual (optional but useful)
         if trays_remaining_total > 0 and trays_per_min > 0:
             mins = trays_remaining_total / trays_per_min
             finish = now + timedelta(minutes=mins)
@@ -924,69 +942,66 @@ class App(tk.Tk):
         else:
             lines.append("TOTAL ACTUAL -> (Run Production + Shortsheet)")
 
-        # STANDARD (per-PLU sum of remaining_trays / StdTPM)
-        def _standard_minutes_for_machine(df: pd.DataFrame, machine_code: str) -> float:
+        # STANDARD (per-line in Product Info) adjusted by lines running
+        def standard_minutes_raw(df: pd.DataFrame, machine_code: str) -> float:
             d = df[df["Machine"].astype(str).str.strip() == machine_code].copy()
             if d.empty:
                 return 0.0
-            # only PLUs with StdTPM > 0
             d["TPM"] = pd.to_numeric(d["TPM"], errors="coerce").fillna(0).astype(float)
             d["TraysRemaining"] = pd.to_numeric(d["TraysRemaining"], errors="coerce").fillna(0).astype(float)
             d = d[(d["TPM"] > 0) & (d["TraysRemaining"] > 0)].copy()
             if d.empty:
                 return 0.0
+            # minutes if ONE line did all work
             return float((d["TraysRemaining"] / d["TPM"]).sum())
 
         if remain_detail is not None:
-            std_mins_o = _standard_minutes_for_machine(remain_detail, MACHINE_OSSID)
-            std_mins_r = _standard_minutes_for_machine(remain_detail, MACHINE_REPAK)
+            std_mins_o_raw = standard_minutes_raw(remain_detail, MACHINE_OSSID)
+            std_mins_r_raw = standard_minutes_raw(remain_detail, MACHINE_REPAK)
+
+            std_mins_o = (std_mins_o_raw / ossid_lines) if std_mins_o_raw > 0 else 0.0
+            std_mins_r = (std_mins_r_raw / repak_lines) if std_mins_r_raw > 0 else 0.0
             std_mins_total = std_mins_o + std_mins_r
 
             if std_mins_o > 0:
                 finish_o = now + timedelta(minutes=std_mins_o)
-                lines.append(f"OSSID STANDARD -> Est: {std_mins_o/60:,.2f} hrs | Finish: {finish_o.strftime('%H:%M')}")
+                lines.append(f"OSSID STANDARD (Adj) -> Lines: {ossid_lines} | Est: {std_mins_o/60:,.2f} hrs | Finish: {finish_o.strftime('%H:%M')}")
             else:
-                lines.append("OSSID STANDARD -> StdTPM missing/0 for remaining Ossid items.")
+                lines.append("OSSID STANDARD (Adj) -> StdTPM missing/0 for remaining Ossid items.")
 
             if std_mins_r > 0:
                 finish_r = now + timedelta(minutes=std_mins_r)
-                lines.append(f"REPAK STANDARD -> Est: {std_mins_r/60:,.2f} hrs | Finish: {finish_r.strftime('%H:%M')}")
+                lines.append(f"REPAK STANDARD (Adj) -> Lines: {repak_lines} | Est: {std_mins_r/60:,.2f} hrs | Finish: {finish_r.strftime('%H:%M')}")
             else:
-                lines.append("REPAK STANDARD -> StdTPM missing/0 for remaining Repak items.")
+                lines.append("REPAK STANDARD (Adj) -> StdTPM missing/0 for remaining Repak items.")
 
             if std_mins_total > 0:
                 finish_t = now + timedelta(minutes=std_mins_total)
-                lines.append(f"TOTAL STANDARD -> Est: {std_mins_total/60:,.2f} hrs | Finish: {finish_t.strftime('%H:%M')}")
+                lines.append(f"TOTAL STANDARD (Adj) -> Est: {std_mins_total/60:,.2f} hrs | Finish: {finish_t.strftime('%H:%M')}")
             else:
-                lines.append("TOTAL STANDARD -> (Need StdTPM + remaining trays)")
+                lines.append("TOTAL STANDARD (Adj) -> (Need StdTPM + remaining trays)")
         else:
             lines.append("STANDARD -> (Run Shortsheet + load Product Info with StdTPM)")
 
         self.lbl_estimates.configure(text="\n".join(lines))
 
-        # ---------------- warning vs end time ----------------
+        # Warning vs end time
         self.lbl_warning.configure(text="")
         if start_dt is not None and end_dt is not None:
-            # Actual projections (by machine)
             if trays_remaining_ossid > 0 and trays_per_min_ossid > 0:
                 finish_o = now + timedelta(minutes=(trays_remaining_ossid / trays_per_min_ossid))
                 if finish_o > end_dt:
                     warn_lines.append(f"⚠ OSSID projected finish {finish_o.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
-
             if trays_remaining_repak > 0 and trays_per_min_repak > 0:
                 finish_r = now + timedelta(minutes=(trays_remaining_repak / trays_per_min_repak))
                 if finish_r > end_dt:
                     warn_lines.append(f"⚠ REPAK projected finish {finish_r.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
-
             if trays_remaining_total > 0 and trays_per_min > 0:
                 finish_t = now + timedelta(minutes=(trays_remaining_total / trays_per_min))
                 if finish_t > end_dt:
                     warn_lines.append(f"⚠ TOTAL projected finish {finish_t.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
 
-        if warn_lines:
-            self.lbl_warning.configure(text="\n".join(warn_lines))
-        else:
-            self.lbl_warning.configure(text="")
+        self.lbl_warning.configure(text="\n".join(warn_lines) if warn_lines else "")
 
     # ---------------- Shortsheet ----------------
     def on_run_shortsheets(self):
@@ -1004,8 +1019,8 @@ class App(tk.Tk):
 
         statuses = self._get_short_wip_statuses()
         only_remaining = bool(self.var_only_remaining.get())
-        exclude_missing = bool(self.var_exclude_missing.get())
-        exclude_frozen = bool(self.var_exclude_frozen.get())
+        exclude_missing = bool(self.cfg.exclude_missing_master)
+        exclude_frozen = bool(self.cfg.exclude_frozen_y)
 
         try:
             self._log("Connecting to SQL Server (shortsheet)...")
@@ -1025,7 +1040,8 @@ class App(tk.Tk):
             if self.master_df is not None and not self.master_df.empty:
                 m = self.master_df.copy()
                 df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
-                df2 = df2.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]], on="PLU", how="left")
+                df2 = df2.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]],
+                                on="PLU", how="left")
                 df2 = df2.rename(columns={"DESC": "ProductDescription", "Trays": "TraysPerCase", "TPM": "StdTPM"})
             else:
                 df2["ProductDescription"] = ""
@@ -1095,8 +1111,6 @@ class App(tk.Tk):
 
         pack_param = int(pack) if pack.isdigit() else pack
         machine_filter = (self.var_machine.get() or "All").strip()
-        exclude_missing = bool(self.var_exclude_missing.get())
-        exclude_frozen = bool(self.var_exclude_frozen.get())
 
         try:
             parse_hhmm(self.var_start_time.get())
@@ -1124,22 +1138,22 @@ class App(tk.Tk):
             merged = prod_df.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]], on="PLU", how="left")
 
             merged = merged.rename(columns={"Trays": "TraysPerCase", "TPM": "StdTPM"})
-            merged["TraysPerCase"] = pd.to_numeric(merged["TraysPerCase"], errors="coerce")
+            merged["TraysPerCase"] = pd.to_numeric(merged["TraysPerCase"], errors="coerce").fillna(0).astype(float)
             merged["StdTPM"] = pd.to_numeric(merged["StdTPM"], errors="coerce").fillna(0).astype(float)
             merged["CasesProduced"] = pd.to_numeric(merged["CasesProduced"], errors="coerce").fillna(0).astype(float)
             merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
 
-            if exclude_missing:
-                merged = merged[merged["TraysPerCase"].notna()].copy()
+            if self.cfg.exclude_missing_master:
+                # Consider missing master if trays per case is 0 (common if merge missed)
+                merged = merged[merged["TraysPerCase"] > 0].copy()
 
-            if exclude_frozen:
+            if self.cfg.exclude_frozen_y:
                 merged["Frozen"] = merged["Frozen"].astype(str).str.strip().str.upper()
                 merged = merged[merged["Frozen"] != "Y"].copy()
 
             merged["Machine"] = merged["Machine"].fillna("Unknown").astype(str).str.strip()
             merged["Type"] = merged["Type"].fillna("Unknown")
             merged["DESC"] = merged["DESC"].fillna("")
-            merged["TraysPerCase"] = merged["TraysPerCase"].fillna(0).astype(float)
 
             if machine_filter != "All":
                 merged = merged[merged["Machine"].astype(str).str.strip() == machine_filter].copy()
@@ -1168,7 +1182,8 @@ class App(tk.Tk):
                 f"PackDate: {pack} | Machine filter: {machine_filter}\n"
                 f"Totals -> Cases: {total_cases:,.0f} | Lbs: {total_lbs:,.1f} | Trays: {total_trays:,.0f}\n"
                 f"Statuses: {', '.join(self.production_statuses)}\n"
-                f"Exclude Frozen=Y: {exclude_frozen} | Exclude Missing Master: {exclude_missing}\n"
+                f"Ossid Lines: {self.var_ossid_lines.get()} | Repak Lines: {self.var_repak_lines.get()}\n"
+                f"Exclude Frozen=Y: {self.cfg.exclude_frozen_y} | Exclude Missing Master: {self.cfg.exclude_missing_master}\n"
             )
 
             self.prod_table.set_dataframe(merged_display)
@@ -1260,6 +1275,12 @@ class App(tk.Tk):
         ttk.Label(frm, text="End (HH:MM):").grid(row=r, column=6, sticky="w", **pad)
         ttk.Entry(frm, textvariable=self.var_end_time, width=8).grid(row=r, column=7, sticky="w", **pad)
 
+        ttk.Label(frm, text="Ossid Lines:").grid(row=r, column=8, sticky="w", **pad)
+        ttk.Spinbox(frm, from_=1, to=7, textvariable=self.var_ossid_lines, width=5).grid(row=r, column=9, sticky="w", **pad)
+
+        ttk.Label(frm, text="Repak Lines:").grid(row=r, column=10, sticky="w", **pad)
+        ttk.Spinbox(frm, from_=1, to=7, textvariable=self.var_repak_lines, width=5).grid(row=r, column=11, sticky="w", **pad)
+
         r += 1
         ttk.Button(frm, text="Refresh Production", command=self.on_refresh_production).grid(row=r, column=0, sticky="w", **pad)
         ttk.Button(frm, text="Export Production Excel", command=self.on_export_production).grid(row=r, column=1, sticky="w", **pad)
@@ -1267,17 +1288,17 @@ class App(tk.Tk):
         self.prod_summary = tk.Text(self.tab_prod, height=8, wrap="word")
         self.prod_summary.pack(fill="x", padx=10, pady=10)
 
+        ttk.Label(self.tab_prod, text="Production by PLU").pack(anchor="w", padx=10)
         self.prod_table = TableView(self.tab_prod, columns=[
             "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
             "CasesProduced", "LbsProduced", "TraysProduced"
         ], height=10)
-        ttk.Label(self.tab_prod, text="Production by PLU").pack(anchor="w", padx=10)
         self.prod_table.pack(fill="both", expand=True, padx=10, pady=6)
 
+        ttk.Label(self.tab_prod, text="Production by Primal (Type)").pack(anchor="w", padx=10)
         self.primal_table = TableView(self.tab_prod, columns=[
             "Machine", "Type", "CasesProduced", "LbsProduced", "TraysProduced"
         ], height=8)
-        ttk.Label(self.tab_prod, text="Production by Primal (Type)").pack(anchor="w", padx=10)
         self.primal_table.pack(fill="both", expand=True, padx=10, pady=6)
 
 
