@@ -36,6 +36,8 @@ class AppConfig:
     product_excel_path: str = "Product Info.xlsx"
     product_sheet_name: str = ""
     output_folder: str = ""
+    exclude_missing_master: bool = True
+    exclude_frozen_y: bool = False
 
 
 def load_config() -> AppConfig:
@@ -387,9 +389,6 @@ class RatioBlock(tk.Frame):
 # Scrollable frame helper
 # -----------------------------
 class ScrollableFrame(ttk.Frame):
-    """A scrollable container using a Canvas.
-    Works well for big dashboards: wheel scroll + scrollbar.
-    """
     def __init__(self, parent):
         super().__init__(parent)
 
@@ -406,23 +405,157 @@ class ScrollableFrame(ttk.Frame):
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # mousewheel
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.canvas.bind_all("<Shift-MouseWheel>", self._on_mousewheel_h)
 
     def _on_inner_configure(self, _event):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _on_canvas_configure(self, event):
-        # Make inner frame match canvas width
         self.canvas.itemconfigure(self.window_id, width=event.width)
 
     def _on_mousewheel(self, event):
-        # Windows wheel is event.delta multiples of 120
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    def _on_mousewheel_h(self, event):
-        self.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+
+# -----------------------------
+# Settings popup
+# -----------------------------
+class SettingsWindow(tk.Toplevel):
+    def __init__(self, parent, cfg: AppConfig, on_apply_callback):
+        super().__init__(parent)
+        self.title("Settings")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.on_apply_callback = on_apply_callback
+
+        self.var_server = tk.StringVar(value=cfg.server)
+        self.var_database = tk.StringVar(value=cfg.database)
+        self.var_driver = tk.StringVar(value=cfg.driver)
+        self.var_auth = tk.StringVar(value=cfg.auth_mode)
+        self.var_user = tk.StringVar(value=cfg.username)
+        self.var_pass = tk.StringVar(value=cfg.password)
+
+        self.var_product_path = tk.StringVar(value=cfg.product_excel_path)
+        self.var_product_sheet = tk.StringVar(value=cfg.product_sheet_name)
+        self.var_output_folder = tk.StringVar(value=cfg.output_folder or os.getcwd())
+
+        self.var_exclude_missing = tk.BooleanVar(value=cfg.exclude_missing_master)
+        self.var_exclude_frozen = tk.BooleanVar(value=cfg.exclude_frozen_y)
+
+        pad = {"padx": 10, "pady": 6}
+
+        frm = ttk.Frame(self)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        r = 0
+        ttk.Label(frm, text="Server:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_server, width=30).grid(row=r, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="Database:").grid(row=r, column=2, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_database, width=10).grid(row=r, column=3, sticky="w", **pad)
+
+        r += 1
+        ttk.Label(frm, text="Driver:").grid(row=r, column=0, sticky="w", **pad)
+        drivers = list_odbc_drivers()
+        self.cmb_driver = ttk.Combobox(frm, textvariable=self.var_driver, values=drivers, width=28)
+        self.cmb_driver.grid(row=r, column=1, sticky="w", **pad)
+        if drivers and not self.var_driver.get():
+            self.var_driver.set(drivers[0])
+
+        ttk.Label(frm, text="Auth:").grid(row=r, column=2, sticky="w", **pad)
+        self.cmb_auth = ttk.Combobox(frm, textvariable=self.var_auth, values=["windows", "sql"], width=10, state="readonly")
+        self.cmb_auth.grid(row=r, column=3, sticky="w", **pad)
+        self.cmb_auth.bind("<<ComboboxSelected>>", lambda e: self._refresh_auth_state())
+
+        r += 1
+        ttk.Label(frm, text="User:").grid(row=r, column=0, sticky="w", **pad)
+        self.ent_user = ttk.Entry(frm, textvariable=self.var_user, width=20)
+        self.ent_user.grid(row=r, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="Pass:").grid(row=r, column=2, sticky="w", **pad)
+        self.ent_pass = ttk.Entry(frm, textvariable=self.var_pass, width=18, show="*")
+        self.ent_pass.grid(row=r, column=3, sticky="w", **pad)
+
+        r += 1
+        ttk.Label(frm, text="Product Excel:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_product_path, width=55).grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Button(frm, text="Browse", command=self._browse_product).grid(row=r, column=3, sticky="w", **pad)
+
+        r += 1
+        ttk.Label(frm, text="Output Folder:").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(frm, textvariable=self.var_output_folder, width=55).grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Button(frm, text="Browse", command=self._browse_output).grid(row=r, column=3, sticky="w", **pad)
+
+        r += 1
+        ttk.Checkbutton(frm, text="Exclude PLUs missing from Product Info.xlsx", variable=self.var_exclude_missing).grid(
+            row=r, column=0, columnspan=2, sticky="w", **pad
+        )
+        ttk.Checkbutton(frm, text="Exclude Frozen Items (Frozen = Y)", variable=self.var_exclude_frozen).grid(
+            row=r, column=2, columnspan=2, sticky="w", **pad
+        )
+
+        r += 1
+        btns = ttk.Frame(frm)
+        btns.grid(row=r, column=0, columnspan=4, sticky="e", padx=10, pady=(10, 0))
+
+        ttk.Button(btns, text="Test Connection", command=self._test_connection).pack(side="left", padx=8)
+        ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=8)
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="left", padx=8)
+
+        self._refresh_auth_state()
+
+    def _refresh_auth_state(self):
+        is_sql = self.var_auth.get().strip().lower() == "sql"
+        state = "normal" if is_sql else "disabled"
+        self.ent_user.configure(state=state)
+        self.ent_pass.configure(state=state)
+
+    def _browse_product(self):
+        path = filedialog.askopenfilename(
+            title="Select Product Info Excel",
+            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
+        )
+        if path:
+            self.var_product_path.set(path)
+
+    def _browse_output(self):
+        folder = filedialog.askdirectory(title="Select Output Folder")
+        if folder:
+            self.var_output_folder.set(folder)
+
+    def _test_connection(self):
+        cfg = self._build_cfg()
+        ok, msg = test_connection(cfg)
+        if ok:
+            messagebox.showinfo("Connection", msg, parent=self)
+        else:
+            messagebox.showerror("Connection", msg, parent=self)
+
+    def _build_cfg(self) -> AppConfig:
+        return AppConfig(
+            server=self.var_server.get().strip(),
+            database=self.var_database.get().strip() or "WPL",
+            driver=self.var_driver.get().strip(),
+            auth_mode=self.var_auth.get().strip().lower(),
+            username=self.var_user.get().strip(),
+            password=self.var_pass.get(),
+            product_excel_path=self.var_product_path.get().strip(),
+            product_sheet_name=self.var_product_sheet.get().strip(),
+            output_folder=self.var_output_folder.get().strip(),
+            exclude_missing_master=bool(self.var_exclude_missing.get()),
+            exclude_frozen_y=bool(self.var_exclude_frozen.get()),
+        )
+
+    def _save(self):
+        cfg = self._build_cfg()
+        try:
+            save_config(cfg)
+            self.on_apply_callback(cfg)
+            messagebox.showinfo("Settings", "Saved.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Settings", str(e), parent=self)
 
 
 # -----------------------------
@@ -440,24 +573,9 @@ class App(tk.Tk):
         self.last_shortsheets_df: pd.DataFrame | None = None
         self.last_production_df: pd.DataFrame | None = None
 
-        # Connection vars
-        self.var_server = tk.StringVar(value=self.cfg.server)
-        self.var_database = tk.StringVar(value=self.cfg.database)
-        self.var_driver = tk.StringVar(value=self.cfg.driver)
-        self.var_auth = tk.StringVar(value=self.cfg.auth_mode)
-        self.var_user = tk.StringVar(value=self.cfg.username)
-        self.var_pass = tk.StringVar(value=self.cfg.password)
-
-        # Product master vars
-        self.var_product_path = tk.StringVar(value=self.cfg.product_excel_path)
-        self.var_product_sheet = tk.StringVar(value=self.cfg.product_sheet_name)
-
-        # Output
-        self.var_output_folder = tk.StringVar(value=self.cfg.output_folder or os.getcwd())
-
-        # Options
-        self.var_exclude_missing = tk.BooleanVar(value=True)
-        self.var_exclude_frozen = tk.BooleanVar(value=False)
+        # Options are stored in cfg now
+        self.var_exclude_missing = tk.BooleanVar(value=self.cfg.exclude_missing_master)
+        self.var_exclude_frozen = tk.BooleanVar(value=self.cfg.exclude_frozen_y)
 
         # Shortsheet inputs
         self.var_txndate = tk.StringVar(value=date.today().isoformat())
@@ -475,91 +593,26 @@ class App(tk.Tk):
         self.production_statuses = ["Available", "ScanningSalesOrder", "WaitingToBeInvoiced", "Shipped"]
 
         self._build_ui()
-        self._refresh_auth_state()
         self._log("Ready.")
         self._load_master(initial=True)
 
-        # Default: hide settings for clean view
-        self._set_settings_visible(False)
-
-    # ---------------- UI ----------------
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
-
-        # Top bar with toggle
+        # Top bar
         topbar = ttk.Frame(self)
-        topbar.pack(fill="x", padx=10, pady=(10, 0))
+        topbar.pack(fill="x", padx=10, pady=(10, 6))
 
-        self.var_settings_visible = tk.BooleanVar(value=True)
-        self.btn_toggle = ttk.Button(topbar, text="Show Settings", command=self.toggle_settings)
-        self.btn_toggle.pack(side="left")
-
+        ttk.Button(topbar, text="⚙ Settings…", command=self.open_settings).pack(side="left")
         ttk.Label(topbar, text="   ").pack(side="left")
-        ttk.Label(topbar, text="(Use this to show/hide SQL + file options)", foreground="#666").pack(side="left")
-
-        # Settings panel (collapsible)
-        self.frm_settings = ttk.LabelFrame(self, text="Connection + Files")
-        self.frm_settings.pack(fill="x", padx=10, pady=6)
-
-        r = 0
-        ttk.Label(self.frm_settings, text="Server:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(self.frm_settings, textvariable=self.var_server, width=32).grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(self.frm_settings, text="Database:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Entry(self.frm_settings, textvariable=self.var_database, width=12).grid(row=r, column=3, sticky="w", **pad)
-
-        ttk.Label(self.frm_settings, text="Driver:").grid(row=r, column=4, sticky="w", **pad)
-        drivers = list_odbc_drivers()
-        self.cmb_driver = ttk.Combobox(self.frm_settings, textvariable=self.var_driver, values=drivers, width=28)
-        self.cmb_driver.grid(row=r, column=5, sticky="w", **pad)
-        if drivers and not self.var_driver.get():
-            self.var_driver.set(drivers[0])
-
-        r += 1
-        ttk.Label(self.frm_settings, text="Auth:").grid(row=r, column=0, sticky="w", **pad)
-        self.cmb_auth = ttk.Combobox(self.frm_settings, textvariable=self.var_auth, values=["windows", "sql"], width=10, state="readonly")
-        self.cmb_auth.grid(row=r, column=1, sticky="w", **pad)
-        self.cmb_auth.bind("<<ComboboxSelected>>", lambda e: self._refresh_auth_state())
-
-        ttk.Label(self.frm_settings, text="User:").grid(row=r, column=2, sticky="w", **pad)
-        self.ent_user = ttk.Entry(self.frm_settings, textvariable=self.var_user, width=20)
-        self.ent_user.grid(row=r, column=3, sticky="w", **pad)
-
-        ttk.Label(self.frm_settings, text="Pass:").grid(row=r, column=4, sticky="w", **pad)
-        self.ent_pass = ttk.Entry(self.frm_settings, textvariable=self.var_pass, width=18, show="*")
-        self.ent_pass.grid(row=r, column=5, sticky="w", **pad)
-
-        r += 1
-        ttk.Label(self.frm_settings, text="Product Excel:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(self.frm_settings, textvariable=self.var_product_path, width=60).grid(row=r, column=1, columnspan=3, sticky="w", **pad)
-        ttk.Button(self.frm_settings, text="Browse", command=self.on_browse_product).grid(row=r, column=4, sticky="w", **pad)
-        ttk.Button(self.frm_settings, text="Load Master", command=self._load_master).grid(row=r, column=5, sticky="w", **pad)
-
-        r += 1
-        ttk.Label(self.frm_settings, text="Output Folder:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(self.frm_settings, textvariable=self.var_output_folder, width=60).grid(row=r, column=1, columnspan=3, sticky="w", **pad)
-        ttk.Button(self.frm_settings, text="Browse", command=self.on_browse_output).grid(row=r, column=4, sticky="w", **pad)
-        ttk.Button(self.frm_settings, text="Test Connection", command=self.on_test_connection).grid(row=r, column=5, sticky="w", **pad)
-
-        r += 1
-        ttk.Checkbutton(self.frm_settings, text="Exclude PLUs missing from Product Info.xlsx", variable=self.var_exclude_missing).grid(
-            row=r, column=0, columnspan=3, sticky="w", **pad
-        )
-        ttk.Checkbutton(self.frm_settings, text="Exclude Frozen Items (Frozen = Y)", variable=self.var_exclude_frozen).grid(
-            row=r, column=3, columnspan=2, sticky="w", **pad
-        )
-        ttk.Button(self.frm_settings, text="Save Settings", command=self.on_save_settings).grid(row=r, column=5, sticky="w", **pad)
+        ttk.Button(topbar, text="Refresh Dashboard", command=self.refresh_dashboard).pack(side="left")
 
         # Tabs
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Dashboard tab is scrollable
         self.tab_dash = ttk.Frame(self.nb)
         self.dash_scroll = ScrollableFrame(self.tab_dash)
         self.dash_scroll.pack(fill="both", expand=True)
 
-        # Real dashboard content lives inside scrollable inner
         self.dash_root = tk.Frame(self.dash_scroll.inner, bg="#000000")
         self.dash_root.pack(fill="both", expand=True)
 
@@ -580,20 +633,68 @@ class App(tk.Tk):
         self.txt_log = tk.Text(frm_log, height=8, wrap="word")
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def toggle_settings(self):
-        self._set_settings_visible(not self._settings_visible)
+    def open_settings(self):
+        SettingsWindow(self, self.cfg, self._apply_settings)
 
-    def _set_settings_visible(self, visible: bool):
-        self._settings_visible = visible
-        if visible:
-            self.frm_settings.pack(fill="x", padx=10, pady=6)
-            self.btn_toggle.configure(text="Hide Settings")
-        else:
-            self.frm_settings.pack_forget()
-            self.btn_toggle.configure(text="Show Settings")
+    def _apply_settings(self, cfg: AppConfig):
+        # called after Save
+        self.cfg = cfg
+        self.var_exclude_missing.set(cfg.exclude_missing_master)
+        self.var_exclude_frozen.set(cfg.exclude_frozen_y)
+        self._log("Settings applied.")
+        self._load_master(initial=True)
 
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.txt_log.insert("end", f"[{ts}] {msg}\n")
+        self.txt_log.see("end")
+        self.update_idletasks()
+
+    def _parse_txndate(self) -> date:
+        return datetime.strptime(self.var_txndate.get().strip(), "%Y-%m-%d").date()
+
+    def _get_short_wip_statuses(self) -> list[str]:
+        statuses = []
+        if self.var_wip_available.get():
+            statuses.append("Available")
+        if self.var_wip_scanning.get():
+            statuses.append("ScanningSalesOrder")
+        if self.var_wip_waiting.get():
+            statuses.append("WaitingToBeInvoiced")
+        return statuses or ["Available"]
+
+    def _load_master(self, initial: bool = False):
+        try:
+            path = (self.cfg.product_excel_path or "").strip()
+            sheet = (self.cfg.product_sheet_name or "").strip()
+            if not path or not os.path.exists(path):
+                self.master_df = pd.DataFrame()
+                if hasattr(self, "cmb_machine"):
+                    self.cmb_machine.configure(values=["All"])
+                    self.var_machine.set("All")
+                if not initial:
+                    messagebox.showwarning("Product Master", "Product Excel not found. Set it in Settings.")
+                return
+
+            self._log(f"Loading product master: {path}")
+            self.master_df = load_product_master(path, sheet)
+            self._log(f"Loaded product master rows: {len(self.master_df):,}")
+
+            machines = product_machines(self.master_df)
+            if hasattr(self, "cmb_machine"):
+                self.cmb_machine.configure(values=machines)
+                if self.var_machine.get() not in machines:
+                    self.var_machine.set("All")
+        except Exception as e:
+            self._log(f"ERROR loading product master: {e}")
+            self._log(traceback.format_exc())
+            self.master_df = pd.DataFrame()
+            if not initial:
+                messagebox.showerror("Product Master Error", str(e))
+
+    # ---------------- Dashboard ----------------
     def _build_tab_dashboard(self):
-        root = self.dash_root  # black background
+        root = self.dash_root
 
         self.lbl_dash_time = tk.Label(root, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 10, "bold"))
         self.lbl_dash_time.place(relx=0.98, rely=0.02, anchor="ne")
@@ -648,17 +749,322 @@ class App(tk.Tk):
                                       justify="left")
         self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 10))
 
-        btn = tk.Button(root, text="REFRESH DASHBOARD", command=self.refresh_dashboard,
-                        bg="#101010", fg="#00ff00", activebackground="#202020", activeforeground="#00ff00",
-                        relief="solid", bd=1, font=("Segoe UI", 12, "bold"))
-        btn.pack(anchor="w", padx=60, pady=(0, 20))
-
-        # Add some bottom space so scrolling feels normal
         spacer = tk.Frame(root, bg="#000000", height=120)
         spacer.pack(fill="x")
 
         self.refresh_dashboard()
 
+    def refresh_dashboard(self):
+        now = datetime.now()
+        self.lbl_dash_time.configure(text=now.strftime("%m/%d/%Y %H:%M"))
+
+        trays_completed_total = 0.0
+        cases_completed_total = 0.0
+        trays_completed_ossid = 0.0
+        trays_completed_repak = 0.0
+        cases_completed_ossid = 0.0
+        cases_completed_repak = 0.0
+
+        trays_remaining_total = 0.0
+        cases_remaining_total = 0.0
+        trays_remaining_ossid = 0.0
+        trays_remaining_repak = 0.0
+        cases_remaining_ossid = 0.0
+        cases_remaining_repak = 0.0
+
+        if self.last_production_df is not None and not self.last_production_df.empty:
+            p = self.last_production_df.copy()
+            trays_completed_total = float(p["TraysProduced"].sum())
+            cases_completed_total = float(p["CasesProduced"].sum())
+
+            po = p[p["Machine"].astype(str).str.strip() == MACHINE_OSSID]
+            pr = p[p["Machine"].astype(str).str.strip() == MACHINE_REPAK]
+            trays_completed_ossid = float(po["TraysProduced"].sum()) if not po.empty else 0.0
+            trays_completed_repak = float(pr["TraysProduced"].sum()) if not pr.empty else 0.0
+            cases_completed_ossid = float(po["CasesProduced"].sum()) if not po.empty else 0.0
+            cases_completed_repak = float(pr["CasesProduced"].sum()) if not pr.empty else 0.0
+
+        if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and self.master_df is not None and not self.master_df.empty:
+            ss = self.last_shortsheets_df.copy()
+            m = self.master_df.copy()
+            ss["PLU"] = ss["PLU"].astype(str).str.zfill(5)
+            m["PLU"] = m["PLU"].astype(str).str.zfill(5)
+
+            ss = ss.merge(m[["PLU", "Trays", "Machine"]], on="PLU", how="left")
+            ss["Trays"] = pd.to_numeric(ss["Trays"], errors="coerce").fillna(0).astype(float)
+            ss["RemainingCases"] = pd.to_numeric(ss["RemainingCases"], errors="coerce").fillna(0).astype(float)
+            ss["Machine"] = ss["Machine"].fillna("Unknown").astype(str).str.strip()
+            ss["TraysRemaining"] = ss["RemainingCases"] * ss["Trays"]
+
+            trays_remaining_total = float(ss["TraysRemaining"].sum())
+            cases_remaining_total = float(ss["RemainingCases"].sum())
+
+            so = ss[ss["Machine"] == MACHINE_OSSID]
+            sr = ss[ss["Machine"] == MACHINE_REPAK]
+            trays_remaining_ossid = float(so["TraysRemaining"].sum()) if not so.empty else 0.0
+            trays_remaining_repak = float(sr["TraysRemaining"].sum()) if not sr.empty else 0.0
+            cases_remaining_ossid = float(so["RemainingCases"].sum()) if not so.empty else 0.0
+            cases_remaining_repak = float(sr["RemainingCases"].sum()) if not sr.empty else 0.0
+
+        trays_per_min = 0.0
+        try:
+            st = parse_hhmm(self.var_start_time.get())
+            start_dt = datetime.combine(now.date(), st)
+            mins = minutes_between(start_dt, now)
+            if mins > 0:
+                trays_per_min = trays_completed_total / mins
+        except Exception:
+            pass
+
+        self.kpi_traypack.set_value(f"{trays_completed_total:,.0f}" if trays_completed_total > 0 else "—")
+        self.kpi_traysmin.set_value(f"{trays_per_min:,.2f}" if trays_per_min > 0 else "—")
+        self.kpi_tpcases.set_value(f"{cases_completed_total:,.0f}" if cases_completed_total > 0 else "—")
+        self.kpi_casesmin.set_value(f"{(cases_completed_total / max(1, mins)) if 'mins' in locals() and mins > 0 else 0:,.2f}" if ('mins' in locals() and mins > 0) else "—")
+
+        self.kpi_trays_to_complete.set_value(f"{trays_remaining_total:,.0f}" if trays_remaining_total > 0 else "—")
+        self.kpi_cases_to_complete.set_value(f"{cases_remaining_total:,.0f}" if cases_remaining_total > 0 else "—")
+
+        self.tray_completed.set_values(f"{trays_completed_ossid:,.0f}", f"{trays_completed_repak:,.0f}")
+        self.tray_remaining.set_values(f"{trays_remaining_ossid:,.0f}", f"{trays_remaining_repak:,.0f}")
+        self.case_completed.set_values(f"{cases_completed_ossid:,.0f}", f"{cases_completed_repak:,.0f}")
+        self.case_remaining.set_values(f"{cases_remaining_ossid:,.0f}", f"{cases_remaining_repak:,.0f}")
+
+        lines = []
+        if trays_remaining_total > 0 and trays_per_min > 0:
+            est_min = trays_remaining_total / trays_per_min
+            finish = now + timedelta(minutes=est_min)
+            lines.append(f"Based on ACTUAL -> {trays_per_min:,.2f} trays/min | Est: {est_min/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}")
+        else:
+            lines.append("Based on ACTUAL -> (Run Production + Shortsheet)")
+
+        self.lbl_estimates.configure(text="\n".join(lines))
+
+    # ---------------- Shortsheet ----------------
+    def on_run_shortsheets(self):
+        if pyodbc is None:
+            messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
+            return
+
+        self._load_master(initial=True)
+
+        try:
+            txnd = self._parse_txndate()
+        except ValueError:
+            messagebox.showerror("TxnDate", "Enter TxnDate as YYYY-MM-DD.")
+            return
+
+        statuses = self._get_short_wip_statuses()
+        only_remaining = bool(self.var_only_remaining.get())
+        exclude_missing = bool(self.var_exclude_missing.get())
+        exclude_frozen = bool(self.var_exclude_frozen.get())
+
+        try:
+            self._log("Connecting to SQL Server (shortsheet)...")
+            with pyodbc.connect(build_connection_string(self.cfg), timeout=25) as conn:
+                df = fetch_shortsheets(conn, txnd, statuses, only_remaining)
+
+            if df.empty:
+                self._log("Shortsheet returned 0 rows.")
+                self.last_shortsheets_df = df
+                self.short_table.set_dataframe(pd.DataFrame(columns=self.short_table.columns))
+                self.refresh_dashboard()
+                messagebox.showinfo("Shortsheet", "No remaining balances found.")
+                return
+
+            df2 = df.copy()
+
+            if self.master_df is not None and not self.master_df.empty:
+                m = self.master_df.copy()
+                df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
+                df2 = df2.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]], on="PLU", how="left")
+                df2 = df2.rename(columns={"DESC": "ProductDescription", "Trays": "TraysPerCase", "TPM": "StdTPM"})
+            else:
+                df2["ProductDescription"] = ""
+                df2["TraysPerCase"] = None
+                df2["Frozen"] = ""
+
+            if exclude_missing and self.master_df is not None and not self.master_df.empty:
+                df2["TraysPerCase"] = pd.to_numeric(df2["TraysPerCase"], errors="coerce")
+                df2 = df2[df2["TraysPerCase"].notna()].copy()
+
+            if exclude_frozen:
+                df2["Frozen"] = df2["Frozen"].astype(str).str.strip().str.upper()
+                df2 = df2[df2["Frozen"] != "Y"].copy()
+
+            show_cols = ["ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
+            for c in show_cols:
+                if c not in df2.columns:
+                    df2[c] = ""
+            df2 = df2[show_cols]
+
+            self.last_shortsheets_df = df2
+            self.short_table.set_dataframe(df2)
+            self._log(f"Shortsheet rows: {len(df2):,}")
+            self.refresh_dashboard()
+        except Exception as e:
+            self._log(f"ERROR shortsheet: {e}")
+            self._log(traceback.format_exc())
+            messagebox.showerror("Shortsheet Error", str(e))
+
+    def on_export_shortsheets(self):
+        if self.last_shortsheets_df is None or self.last_shortsheets_df.empty:
+            messagebox.showinfo("Export", "Run Shortsheet first.")
+            return
+
+        out_folder = (self.cfg.output_folder or "").strip() or os.getcwd()
+        os.makedirs(out_folder, exist_ok=True)
+
+        try:
+            txnd = self._parse_txndate()
+        except ValueError:
+            txnd = date.today()
+
+        out_path = os.path.join(out_folder, f"Shortsheet_TxnDate_{txnd.isoformat()}.xlsx")
+        try:
+            export_to_excel(self.last_shortsheets_df, out_path, "Shortsheet")
+            self._log(f"Exported shortsheet: {out_path}")
+            messagebox.showinfo("Export", f"Saved:\n{out_path}")
+        except Exception as e:
+            self._log(f"ERROR exporting shortsheet: {e}")
+            messagebox.showerror("Export Error", str(e))
+
+    # ---------------- Production ----------------
+    def on_refresh_production(self):
+        if pyodbc is None:
+            messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
+            return
+
+        self._load_master(initial=True)
+        if self.master_df is None or self.master_df.empty:
+            messagebox.showerror("Product Master", "Load Product Info.xlsx first (Settings).")
+            return
+
+        pack = (self.var_packdate.get() or "").strip()
+        if not pack:
+            messagebox.showerror("PackDate", "Enter the 4-digit packdate code (e.g., 1307).")
+            return
+
+        pack_param = int(pack) if pack.isdigit() else pack
+        machine_filter = (self.var_machine.get() or "All").strip()
+        exclude_missing = bool(self.var_exclude_missing.get())
+        exclude_frozen = bool(self.var_exclude_frozen.get())
+
+        try:
+            parse_hhmm(self.var_start_time.get())
+            parse_hhmm(self.var_end_time.get())
+        except Exception:
+            messagebox.showerror("Time", "Enter Start/End time as HH:MM (24-hour), e.g., 08:30")
+            return
+
+        try:
+            self._log("Connecting to SQL Server (production)...")
+            with pyodbc.connect(build_connection_string(self.cfg), timeout=25) as conn:
+                prod_df = fetch_production_by_packdate(conn, pack_param, self.production_statuses)
+
+            if prod_df.empty:
+                self._log("Production query returned 0 rows.")
+                self.last_production_df = pd.DataFrame()
+                self.prod_table.set_dataframe(pd.DataFrame(columns=self.prod_table.columns))
+                self.primal_table.set_dataframe(pd.DataFrame(columns=self.primal_table.columns))
+                self.refresh_dashboard()
+                messagebox.showinfo("Production", "No production found for that packdate/status set.")
+                return
+
+            m = self.master_df.copy()
+            prod_df["PLU"] = prod_df["PLU"].astype(str).str.zfill(5)
+            merged = prod_df.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]], on="PLU", how="left")
+
+            merged = merged.rename(columns={"Trays": "TraysPerCase", "TPM": "StdTPM"})
+            merged["TraysPerCase"] = pd.to_numeric(merged["TraysPerCase"], errors="coerce")
+            merged["StdTPM"] = pd.to_numeric(merged["StdTPM"], errors="coerce").fillna(0).astype(float)
+            merged["CasesProduced"] = pd.to_numeric(merged["CasesProduced"], errors="coerce").fillna(0).astype(float)
+            merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
+
+            if exclude_missing:
+                merged = merged[merged["TraysPerCase"].notna()].copy()
+
+            if exclude_frozen:
+                merged["Frozen"] = merged["Frozen"].astype(str).str.strip().str.upper()
+                merged = merged[merged["Frozen"] != "Y"].copy()
+
+            merged["Machine"] = merged["Machine"].fillna("Unknown").astype(str).str.strip()
+            merged["Type"] = merged["Type"].fillna("Unknown")
+            merged["DESC"] = merged["DESC"].fillna("")
+            merged["TraysPerCase"] = merged["TraysPerCase"].fillna(0).astype(float)
+
+            if machine_filter != "All":
+                merged = merged[merged["Machine"].astype(str).str.strip() == machine_filter].copy()
+
+            merged["TraysProduced"] = merged["CasesProduced"] * merged["TraysPerCase"]
+            self.last_production_df = merged.copy()
+
+            total_cases = float(merged["CasesProduced"].sum())
+            total_lbs = float(merged["LbsProduced"].sum())
+            total_trays = float(merged["TraysProduced"].sum())
+
+            merged_display = merged[[
+                "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
+                "CasesProduced", "LbsProduced", "TraysProduced"
+            ]].copy().sort_values(by=["Machine", "Type", "TraysProduced"], ascending=[True, True, False])
+
+            primal = merged.groupby(["Machine", "Type"], as_index=False).agg(
+                CasesProduced=("CasesProduced", "sum"),
+                LbsProduced=("LbsProduced", "sum"),
+                TraysProduced=("TraysProduced", "sum"),
+            ).sort_values(by=["Machine", "TraysProduced"], ascending=[True, False])
+
+            self.prod_summary.delete("1.0", "end")
+            self.prod_summary.insert(
+                "end",
+                f"PackDate: {pack} | Machine filter: {machine_filter}\n"
+                f"Totals -> Cases: {total_cases:,.0f} | Lbs: {total_lbs:,.1f} | Trays: {total_trays:,.0f}\n"
+                f"Statuses: {', '.join(self.production_statuses)}\n"
+                f"Exclude Frozen=Y: {exclude_frozen} | Exclude Missing Master: {exclude_missing}\n"
+            )
+
+            self.prod_table.set_dataframe(merged_display)
+            self.primal_table.set_dataframe(primal)
+
+            self._log(f"Production rows (PLU): {len(merged_display):,}")
+            self.refresh_dashboard()
+        except Exception as e:
+            self._log(f"ERROR production: {e}")
+            self._log(traceback.format_exc())
+            messagebox.showerror("Production Error", str(e))
+
+    def on_export_production(self):
+        if self.last_production_df is None or self.last_production_df.empty:
+            messagebox.showinfo("Export", "Refresh Production first.")
+            return
+
+        out_folder = (self.cfg.output_folder or "").strip() or os.getcwd()
+        os.makedirs(out_folder, exist_ok=True)
+
+        pack = (self.var_packdate.get() or "").strip() or "PackDate"
+        machine_filter = (self.var_machine.get() or "All").strip()
+
+        out_path = os.path.join(out_folder, f"Production_PackDate_{pack}_{machine_filter}.xlsx")
+        try:
+            merged = self.last_production_df.copy()
+            by_plu = merged[[
+                "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
+                "CasesProduced", "LbsProduced", "TraysProduced"
+            ]].copy().sort_values(by=["Machine", "Type", "TraysProduced"], ascending=[True, True, False])
+
+            by_type = merged.groupby(["Machine", "Type"], as_index=False).agg(
+                CasesProduced=("CasesProduced", "sum"),
+                LbsProduced=("LbsProduced", "sum"),
+                TraysProduced=("TraysProduced", "sum"),
+            ).sort_values(by=["Machine", "TraysProduced"], ascending=[True, False])
+
+            export_multi_to_excel({"ProductionByPLU": by_plu, "ProductionByType": by_type}, out_path)
+            self._log(f"Exported production: {out_path}")
+            messagebox.showinfo("Export", f"Saved:\n{out_path}")
+        except Exception as e:
+            self._log(f"ERROR exporting production: {e}")
+            messagebox.showerror("Export Error", str(e))
+
+    # ---------------- Tabs ----------------
     def _build_tab_shortsheets(self):
         pad = {"padx": 10, "pady": 6}
 
@@ -724,441 +1130,6 @@ class App(tk.Tk):
         ], height=8)
         ttk.Label(self.tab_prod, text="Production by Primal (Type)").pack(anchor="w", padx=10)
         self.primal_table.pack(fill="both", expand=True, padx=10, pady=6)
-
-    # -------------- helpers --------------
-    def _log(self, msg: str):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.txt_log.insert("end", f"[{ts}] {msg}\n")
-        self.txt_log.see("end")
-        self.update_idletasks()
-
-    def _refresh_auth_state(self):
-        is_sql = self.var_auth.get().strip().lower() == "sql"
-        state = "normal" if is_sql else "disabled"
-        self.ent_user.configure(state=state)
-        self.ent_pass.configure(state=state)
-
-    def _collect_config(self) -> AppConfig:
-        return AppConfig(
-            server=self.var_server.get().strip(),
-            database=self.var_database.get().strip() or "WPL",
-            driver=self.var_driver.get().strip(),
-            auth_mode=self.var_auth.get().strip().lower(),
-            username=self.var_user.get().strip(),
-            password=self.var_pass.get(),
-            product_excel_path=self.var_product_path.get().strip(),
-            product_sheet_name=self.var_product_sheet.get().strip(),
-            output_folder=self.var_output_folder.get().strip(),
-        )
-
-    def _parse_txndate(self) -> date:
-        return datetime.strptime(self.var_txndate.get().strip(), "%Y-%m-%d").date()
-
-    def _get_short_wip_statuses(self) -> list[str]:
-        statuses = []
-        if self.var_wip_available.get():
-            statuses.append("Available")
-        if self.var_wip_scanning.get():
-            statuses.append("ScanningSalesOrder")
-        if self.var_wip_waiting.get():
-            statuses.append("WaitingToBeInvoiced")
-        return statuses or ["Available"]
-
-    def _load_master(self, initial: bool = False):
-        try:
-            path = self.var_product_path.get().strip()
-            sheet = self.var_product_sheet.get().strip()
-            if not path or not os.path.exists(path):
-                if not initial:
-                    messagebox.showwarning("Product Master", "Product Excel not found. Browse to your Product Info.xlsx.")
-                self.master_df = pd.DataFrame()
-                if hasattr(self, "cmb_machine"):
-                    self.cmb_machine.configure(values=["All"])
-                    self.var_machine.set("All")
-                return
-
-            self._log(f"Loading product master: {path}")
-            self.master_df = load_product_master(path, sheet)
-            self._log(f"Loaded product master rows: {len(self.master_df):,}")
-
-            machines = product_machines(self.master_df)
-            if hasattr(self, "cmb_machine"):
-                self.cmb_machine.configure(values=machines)
-                if self.var_machine.get() not in machines:
-                    self.var_machine.set("All")
-        except Exception as e:
-            self._log(f"ERROR loading product master: {e}")
-            self._log(traceback.format_exc())
-            if not initial:
-                messagebox.showerror("Product Master Error", str(e))
-            self.master_df = pd.DataFrame()
-
-    # -------------- settings buttons --------------
-    def on_browse_product(self):
-        path = filedialog.askopenfilename(
-            title="Select Product Info Excel",
-            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
-        )
-        if path:
-            self.var_product_path.set(path)
-
-    def on_browse_output(self):
-        folder = filedialog.askdirectory(title="Select Output Folder")
-        if folder:
-            self.var_output_folder.set(folder)
-
-    def on_save_settings(self):
-        self.cfg = self._collect_config()
-        save_config(self.cfg)
-        self._log("Settings saved to config.json")
-
-    def on_test_connection(self):
-        cfg = self._collect_config()
-        ok, msg = test_connection(cfg)
-        self._log(msg)
-        if ok:
-            messagebox.showinfo("Connection", msg)
-        else:
-            messagebox.showerror("Connection", msg)
-
-    # ---------------- Dashboard math ----------------
-    def refresh_dashboard(self):
-        now = datetime.now()
-        self.lbl_dash_time.configure(text=now.strftime("%m/%d/%Y %H:%M"))
-
-        trays_completed_total = 0.0
-        cases_completed_total = 0.0
-        trays_completed_ossid = 0.0
-        trays_completed_repak = 0.0
-        cases_completed_ossid = 0.0
-        cases_completed_repak = 0.0
-
-        trays_remaining_total = 0.0
-        cases_remaining_total = 0.0
-        trays_remaining_ossid = 0.0
-        trays_remaining_repak = 0.0
-        cases_remaining_ossid = 0.0
-        cases_remaining_repak = 0.0
-
-        if self.last_production_df is not None and not self.last_production_df.empty:
-            p = self.last_production_df.copy()
-            trays_completed_total = float(p["TraysProduced"].sum())
-            cases_completed_total = float(p["CasesProduced"].sum())
-
-            po = p[p["Machine"].astype(str).str.strip() == MACHINE_OSSID]
-            pr = p[p["Machine"].astype(str).str.strip() == MACHINE_REPAK]
-            trays_completed_ossid = float(po["TraysProduced"].sum()) if not po.empty else 0.0
-            trays_completed_repak = float(pr["TraysProduced"].sum()) if not pr.empty else 0.0
-            cases_completed_ossid = float(po["CasesProduced"].sum()) if not po.empty else 0.0
-            cases_completed_repak = float(pr["CasesProduced"].sum()) if not pr.empty else 0.0
-
-        if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and self.master_df is not None and not self.master_df.empty:
-            ss = self.last_shortsheets_df.copy()
-            m = self.master_df.copy()
-            ss["PLU"] = ss["PLU"].astype(str).str.zfill(5)
-            m["PLU"] = m["PLU"].astype(str).str.zfill(5)
-
-            ss = ss.merge(m[["PLU", "Trays", "Machine"]], on="PLU", how="left")
-            ss["Trays"] = pd.to_numeric(ss["Trays"], errors="coerce").fillna(0).astype(float)
-            ss["RemainingCases"] = pd.to_numeric(ss["RemainingCases"], errors="coerce").fillna(0).astype(float)
-            ss["Machine"] = ss["Machine"].fillna("Unknown").astype(str).str.strip()
-            ss["TraysRemaining"] = ss["RemainingCases"] * ss["Trays"]
-
-            trays_remaining_total = float(ss["TraysRemaining"].sum())
-            cases_remaining_total = float(ss["RemainingCases"].sum())
-
-            so = ss[ss["Machine"] == MACHINE_OSSID]
-            sr = ss[ss["Machine"] == MACHINE_REPAK]
-            trays_remaining_ossid = float(so["TraysRemaining"].sum()) if not so.empty else 0.0
-            trays_remaining_repak = float(sr["TraysRemaining"].sum()) if not sr.empty else 0.0
-            cases_remaining_ossid = float(so["RemainingCases"].sum()) if not so.empty else 0.0
-            cases_remaining_repak = float(sr["RemainingCases"].sum()) if not sr.empty else 0.0
-
-        trays_per_min = 0.0
-        cases_per_min = 0.0
-        try:
-            st = parse_hhmm(self.var_start_time.get())
-            start_dt = datetime.combine(now.date(), st)
-            mins = minutes_between(start_dt, now)
-            if mins > 0:
-                trays_per_min = trays_completed_total / mins
-                cases_per_min = cases_completed_total / mins
-        except Exception:
-            pass
-
-        self.kpi_traypack.set_value(f"{trays_completed_total:,.0f}" if trays_completed_total > 0 else "—")
-        self.kpi_traysmin.set_value(f"{trays_per_min:,.2f}" if trays_per_min > 0 else "—")
-        self.kpi_tpcases.set_value(f"{cases_completed_total:,.0f}" if cases_completed_total > 0 else "—")
-        self.kpi_casesmin.set_value(f"{cases_per_min:,.2f}" if cases_per_min > 0 else "—")
-
-        self.kpi_trays_to_complete.set_value(f"{trays_remaining_total:,.0f}" if trays_remaining_total > 0 else "—")
-        self.kpi_cases_to_complete.set_value(f"{cases_remaining_total:,.0f}" if cases_remaining_total > 0 else "—")
-
-        self.tray_completed.set_values(f"{trays_completed_ossid:,.0f}", f"{trays_completed_repak:,.0f}")
-        self.tray_remaining.set_values(f"{trays_remaining_ossid:,.0f}", f"{trays_remaining_repak:,.0f}")
-        self.case_completed.set_values(f"{cases_completed_ossid:,.0f}", f"{cases_completed_repak:,.0f}")
-        self.case_remaining.set_values(f"{cases_remaining_ossid:,.0f}", f"{cases_remaining_repak:,.0f}")
-
-        lines = []
-        if trays_remaining_total > 0 and trays_per_min > 0:
-            est_min = trays_remaining_total / trays_per_min
-            finish = now + timedelta(minutes=est_min)
-            lines.append(f"Based on ACTUAL -> {trays_per_min:,.2f} trays/min | Est: {est_min/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}")
-        else:
-            lines.append("Based on ACTUAL -> (Run Production + Shortsheet)")
-
-        if self.last_production_df is not None and not self.last_production_df.empty and trays_remaining_total > 0:
-            p = self.last_production_df.copy()
-            total_trays_prod = float(p["TraysProduced"].sum())
-            std_weighted = 0.0
-            if total_trays_prod > 0:
-                std_weighted = float((p["StdTPM"] * p["TraysProduced"]).sum() / total_trays_prod)
-
-            if std_weighted > 0:
-                std_min = trays_remaining_total / std_weighted
-                std_finish = now + timedelta(minutes=std_min)
-                lines.append(f"Based on STANDARDS -> {std_weighted:,.2f} trays/min | Est: {std_min/60:,.2f} hrs | Finish: {std_finish.strftime('%H:%M')}")
-            else:
-                lines.append("Based on STANDARDS -> StdTPM missing/0 in Product Info")
-        else:
-            lines.append("Based on STANDARDS -> (Run Production + Shortsheet)")
-
-        self.lbl_estimates.configure(text="\n".join(lines))
-
-    # ---------------- Shortsheet actions ----------------
-    def on_run_shortsheets(self):
-        if pyodbc is None:
-            messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
-            return
-
-        self._load_master(initial=True)
-
-        try:
-            txnd = self._parse_txndate()
-        except ValueError:
-            messagebox.showerror("TxnDate", "Enter TxnDate as YYYY-MM-DD.")
-            return
-
-        statuses = self._get_short_wip_statuses()
-        only_remaining = bool(self.var_only_remaining.get())
-        exclude_missing = bool(self.var_exclude_missing.get())
-        exclude_frozen = bool(self.var_exclude_frozen.get())
-
-        try:
-            cfg = self._collect_config()
-            self._log("Connecting to SQL Server (shortsheet)...")
-            with pyodbc.connect(build_connection_string(cfg), timeout=25) as conn:
-                df = fetch_shortsheets(conn, txnd, statuses, only_remaining)
-
-            if df.empty:
-                self._log("Shortsheet returned 0 rows.")
-                self.last_shortsheets_df = df
-                self.short_table.set_dataframe(pd.DataFrame(columns=self.short_table.columns))
-                self.refresh_dashboard()
-                messagebox.showinfo("Shortsheet", "No remaining balances found.")
-                return
-
-            df2 = df.copy()
-
-            if self.master_df is not None and not self.master_df.empty:
-                m = self.master_df.copy()
-                df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
-                df2 = df2.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]], on="PLU", how="left")
-                df2 = df2.rename(columns={"DESC": "ProductDescription", "Trays": "TraysPerCase", "TPM": "StdTPM"})
-            else:
-                df2["ProductDescription"] = ""
-                df2["TraysPerCase"] = None
-                df2["StdTPM"] = 0
-                df2["Frozen"] = ""
-
-            if exclude_missing and self.master_df is not None and not self.master_df.empty:
-                df2["TraysPerCase"] = pd.to_numeric(df2["TraysPerCase"], errors="coerce")
-                before = len(df2)
-                df2 = df2[df2["TraysPerCase"].notna()].copy()
-                after = len(df2)
-                self._log(f"Exclude missing Product Info: removed {before - after} rows")
-
-            if exclude_frozen:
-                before = len(df2)
-                df2["Frozen"] = df2["Frozen"].astype(str).str.strip().str.upper()
-                df2 = df2[df2["Frozen"] != "Y"].copy()
-                after = len(df2)
-                self._log(f"Exclude Frozen=Y: removed {before - after} rows")
-
-            show_cols = ["ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
-            for c in show_cols:
-                if c not in df2.columns:
-                    df2[c] = ""
-            df2 = df2[show_cols]
-
-            self.last_shortsheets_df = df2
-            self.short_table.set_dataframe(df2)
-            self._log(f"Shortsheet rows: {len(df2):,}")
-            self.refresh_dashboard()
-        except Exception as e:
-            self._log(f"ERROR shortsheet: {e}")
-            self._log(traceback.format_exc())
-            messagebox.showerror("Shortsheet Error", str(e))
-
-    def on_export_shortsheets(self):
-        if self.last_shortsheets_df is None or self.last_shortsheets_df.empty:
-            messagebox.showinfo("Export", "Run Shortsheet first.")
-            return
-
-        out_folder = self.var_output_folder.get().strip() or os.getcwd()
-        os.makedirs(out_folder, exist_ok=True)
-
-        try:
-            txnd = self._parse_txndate()
-        except ValueError:
-            txnd = date.today()
-
-        out_path = os.path.join(out_folder, f"Shortsheet_TxnDate_{txnd.isoformat()}.xlsx")
-        try:
-            export_to_excel(self.last_shortsheets_df, out_path, "Shortsheet")
-            self._log(f"Exported shortsheet: {out_path}")
-            messagebox.showinfo("Export", f"Saved:\n{out_path}")
-        except Exception as e:
-            self._log(f"ERROR exporting shortsheet: {e}")
-            messagebox.showerror("Export Error", str(e))
-
-    # ---------------- Production actions ----------------
-    def on_refresh_production(self):
-        if pyodbc is None:
-            messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
-            return
-
-        self._load_master(initial=True)
-        if self.master_df is None or self.master_df.empty:
-            messagebox.showerror("Product Master", "Load Product Info.xlsx first.")
-            return
-
-        pack = (self.var_packdate.get() or "").strip()
-        if not pack:
-            messagebox.showerror("PackDate", "Enter the 4-digit packdate code (e.g., 1307).")
-            return
-
-        pack_param = int(pack) if pack.isdigit() else pack
-        machine_filter = (self.var_machine.get() or "All").strip()
-        exclude_missing = bool(self.var_exclude_missing.get())
-        exclude_frozen = bool(self.var_exclude_frozen.get())
-
-        try:
-            parse_hhmm(self.var_start_time.get())
-            parse_hhmm(self.var_end_time.get())
-        except Exception:
-            messagebox.showerror("Time", "Enter Start/End time as HH:MM (24-hour), e.g., 08:30")
-            return
-
-        try:
-            cfg = self._collect_config()
-            self._log("Connecting to SQL Server (production)...")
-            with pyodbc.connect(build_connection_string(cfg), timeout=25) as conn:
-                prod_df = fetch_production_by_packdate(conn, pack_param, self.production_statuses)
-
-            if prod_df.empty:
-                self._log("Production query returned 0 rows.")
-                self.last_production_df = pd.DataFrame()
-                self.prod_table.set_dataframe(pd.DataFrame(columns=self.prod_table.columns))
-                self.primal_table.set_dataframe(pd.DataFrame(columns=self.primal_table.columns))
-                self.refresh_dashboard()
-                messagebox.showinfo("Production", "No production found for that packdate/status set.")
-                return
-
-            m = self.master_df.copy()
-            prod_df["PLU"] = prod_df["PLU"].astype(str).str.zfill(5)
-            merged = prod_df.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen"]], on="PLU", how="left")
-
-            merged = merged.rename(columns={"Trays": "TraysPerCase", "TPM": "StdTPM"})
-            merged["TraysPerCase"] = pd.to_numeric(merged["TraysPerCase"], errors="coerce")
-            merged["StdTPM"] = pd.to_numeric(merged["StdTPM"], errors="coerce").fillna(0).astype(float)
-            merged["CasesProduced"] = pd.to_numeric(merged["CasesProduced"], errors="coerce").fillna(0).astype(float)
-            merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
-
-            if exclude_missing:
-                merged = merged[merged["TraysPerCase"].notna()].copy()
-
-            if exclude_frozen:
-                merged["Frozen"] = merged["Frozen"].astype(str).str.strip().str.upper()
-                merged = merged[merged["Frozen"] != "Y"].copy()
-
-            merged["Machine"] = merged["Machine"].fillna("Unknown").astype(str).str.strip()
-            merged["Type"] = merged["Type"].fillna("Unknown")
-            merged["DESC"] = merged["DESC"].fillna("")
-            merged["TraysPerCase"] = merged["TraysPerCase"].fillna(0).astype(float)
-
-            if machine_filter != "All":
-                merged = merged[merged["Machine"].astype(str).str.strip() == machine_filter].copy()
-
-            merged["TraysProduced"] = merged["CasesProduced"] * merged["TraysPerCase"]
-
-            self.last_production_df = merged.copy()
-
-            total_cases = float(merged["CasesProduced"].sum())
-            total_lbs = float(merged["LbsProduced"].sum())
-            total_trays = float(merged["TraysProduced"].sum())
-
-            merged_display = merged[[
-                "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
-                "CasesProduced", "LbsProduced", "TraysProduced"
-            ]].copy().sort_values(by=["Machine", "Type", "TraysProduced"], ascending=[True, True, False])
-
-            primal = merged.groupby(["Machine", "Type"], as_index=False).agg(
-                CasesProduced=("CasesProduced", "sum"),
-                LbsProduced=("LbsProduced", "sum"),
-                TraysProduced=("TraysProduced", "sum"),
-            ).sort_values(by=["Machine", "TraysProduced"], ascending=[True, False])
-
-            self.prod_summary.delete("1.0", "end")
-            self.prod_summary.insert(
-                "end",
-                f"PackDate: {pack} | Machine filter: {machine_filter}\n"
-                f"Totals -> Cases: {total_cases:,.0f} | Lbs: {total_lbs:,.1f} | Trays: {total_trays:,.0f}\n"
-                f"Statuses: {', '.join(self.production_statuses)}\n"
-                f"Exclude Frozen=Y: {exclude_frozen} | Exclude Missing Master: {exclude_missing}\n"
-            )
-
-            self.prod_table.set_dataframe(merged_display)
-            self.primal_table.set_dataframe(primal)
-
-            self._log(f"Production rows (PLU): {len(merged_display):,}")
-            self.refresh_dashboard()
-        except Exception as e:
-            self._log(f"ERROR production: {e}")
-            self._log(traceback.format_exc())
-            messagebox.showerror("Production Error", str(e))
-
-    def on_export_production(self):
-        if self.last_production_df is None or self.last_production_df.empty:
-            messagebox.showinfo("Export", "Refresh Production first.")
-            return
-
-        out_folder = self.var_output_folder.get().strip() or os.getcwd()
-        os.makedirs(out_folder, exist_ok=True)
-
-        pack = (self.var_packdate.get() or "").strip() or "PackDate"
-        machine_filter = (self.var_machine.get() or "All").strip()
-
-        out_path = os.path.join(out_folder, f"Production_PackDate_{pack}_{machine_filter}.xlsx")
-        try:
-            merged = self.last_production_df.copy()
-            by_plu = merged[[
-                "Machine", "Type", "ProductNumber", "PLU", "DESC", "TraysPerCase", "StdTPM",
-                "CasesProduced", "LbsProduced", "TraysProduced"
-            ]].copy().sort_values(by=["Machine", "Type", "TraysProduced"], ascending=[True, True, False])
-
-            by_type = merged.groupby(["Machine", "Type"], as_index=False).agg(
-                CasesProduced=("CasesProduced", "sum"),
-                LbsProduced=("LbsProduced", "sum"),
-                TraysProduced=("TraysProduced", "sum"),
-            ).sort_values(by=["Machine", "TraysProduced"], ascending=[True, False])
-
-            export_multi_to_excel({"ProductionByPLU": by_plu, "ProductionByType": by_type}, out_path)
-            self._log(f"Exported production: {out_path}")
-            messagebox.showinfo("Export", f"Saved:\n{out_path}")
-        except Exception as e:
-            self._log(f"ERROR exporting production: {e}")
-            messagebox.showerror("Export Error", str(e))
 
 
 def main():
