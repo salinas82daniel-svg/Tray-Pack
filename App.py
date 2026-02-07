@@ -1646,9 +1646,6 @@ class App(tk.Tk):
         ], height=18)
         self.prod_table.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def _build_tab_dashboard(self):
-        # implemented above (kept here for structure)
-        pass
 
 
 def main():
