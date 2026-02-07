@@ -1,7 +1,7 @@
 import json
 import os
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -39,13 +39,19 @@ class AppConfig:
     exclude_missing_master: bool = True
     exclude_frozen_y: bool = False
 
+    # Planned shorts persisted by TxnDate (YYYY-MM-DD) -> ["00123","04567",...]
+    planned_shorts: dict = field(default_factory=dict)
+
 
 def load_config() -> AppConfig:
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            merged = {**AppConfig().__dict__, **(data or {})}
+                data = json.load(f) or {}
+            merged = {**AppConfig().__dict__, **data}
+            # Ensure planned_shorts is a dict
+            if not isinstance(merged.get("planned_shorts"), dict):
+                merged["planned_shorts"] = {}
             return AppConfig(**merged)
         except Exception:
             return AppConfig()
@@ -129,6 +135,17 @@ def safe_float(x) -> float:
         return float(x)
     except Exception:
         return 0.0
+
+
+def norm_plu(s: str) -> str:
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    # keep only digits if user types "PLU 123"
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if digits:
+        return digits.zfill(5)
+    return s.zfill(5)
 
 
 # -----------------------------
@@ -333,7 +350,7 @@ class TableView(ttk.Frame):
     def __init__(self, parent, columns: list[str], height: int = 12):
         super().__init__(parent)
         self.columns = columns
-        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=height)
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=height, selectmode="browse")
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
@@ -347,7 +364,7 @@ class TableView(ttk.Frame):
 
         for c in columns:
             self.tree.heading(c, text=c)
-            self.tree.column(c, width=120, anchor="w")
+            self.tree.column(c, width=140, anchor="w")
 
     def set_dataframe(self, df: pd.DataFrame):
         for item in self.tree.get_children():
@@ -362,11 +379,31 @@ class TableView(ttk.Frame):
             self.tree.configure(columns=cols)
             for c in cols:
                 self.tree.heading(c, text=c)
-                self.tree.column(c, width=120, anchor="w")
+                self.tree.column(c, width=140, anchor="w")
 
         for _, row in df.iterrows():
             values = [row.get(c, "") for c in self.columns]
             self.tree.insert("", "end", values=values)
+
+    def get_selected_values(self) -> dict:
+        sel = self.tree.selection()
+        if not sel:
+            return {}
+        item = self.tree.item(sel[0])
+        vals = item.get("values", [])
+        if not vals:
+            return {}
+        return {self.columns[i]: vals[i] for i in range(min(len(self.columns), len(vals)))}
+
+    def select_first_match(self, predicate):
+        for iid in self.tree.get_children():
+            vals = self.tree.item(iid).get("values", [])
+            row = {self.columns[i]: vals[i] for i in range(min(len(self.columns), len(vals)))}
+            if predicate(row):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+                return True
+        return False
 
 
 # -----------------------------
@@ -376,7 +413,7 @@ class KpiBlock(tk.Frame):
     def __init__(self, parent, title: str, value_color="#00ff00"):
         super().__init__(parent, bg="#000000")
         self.title = tk.Label(self, text=title, bg="#000000", fg="#00ff00", font=("Segoe UI", 18, "bold"))
-        self.value = tk.Label(self, text="—", bg="#000000", fg=value_color, font=("Segoe UI", 22, "bold"))
+        self.value = tk.Label(self, text="—", bg="#000000", fg=value_color, font=("Segoe UI", 20, "bold"))
         self.title.pack(anchor="center", pady=(2, 0))
         self.value.pack(anchor="center", pady=(0, 8))
 
@@ -581,6 +618,7 @@ class SettingsWindow(tk.Toplevel):
             messagebox.showerror("Connection", msg, parent=self)
 
     def _build_cfg(self) -> AppConfig:
+        # planned_shorts preserved by parent on apply
         return AppConfig(
             server=self.var_server.get().strip(),
             database=self.var_database.get().strip() or "WPL",
@@ -593,10 +631,13 @@ class SettingsWindow(tk.Toplevel):
             output_folder=self.var_output_folder.get().strip(),
             exclude_missing_master=bool(self.var_exclude_missing.get()),
             exclude_frozen_y=bool(self.var_exclude_frozen.get()),
+            planned_shorts={},  # replaced on apply
         )
 
     def _save(self):
         cfg = self._build_cfg()
+        # Keep parent's planned_shorts
+        cfg.planned_shorts = getattr(self.master, "cfg", AppConfig()).planned_shorts or {}
         try:
             save_config(cfg)
             self.on_apply_callback(cfg)
@@ -612,12 +653,17 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1500x920")
+        self.geometry("1600x940")
 
         self.cfg = load_config()
 
         self.master_df: pd.DataFrame | None = None
-        self.last_shortsheets_df: pd.DataFrame | None = None
+
+        # shortsheet data
+        self.last_shortsheets_df: pd.DataFrame | None = None          # for table display
+        self.last_shortsheets_detail: pd.DataFrame | None = None      # for dashboard math
+
+        # production data
         self.last_production_df: pd.DataFrame | None = None
 
         # Shortsheet inputs
@@ -627,13 +673,18 @@ class App(tk.Tk):
         self.var_wip_scanning = tk.BooleanVar(value=True)
         self.var_wip_waiting = tk.BooleanVar(value=True)
 
+        # Planned shorts controls
+        self.var_apply_planned_shorts = tk.BooleanVar(value=True)
+        self.var_planned_search = tk.StringVar(value="")
+        self.var_planned_bulk = tk.StringVar(value="")  # comma/space/newline list
+
         # Production inputs
         self.var_packdate = tk.StringVar(value="")
         self.var_machine = tk.StringVar(value="All")
         self.var_start_time = tk.StringVar(value="08:30")
         self.var_end_time = tk.StringVar(value="17:00")
 
-        # NEW: lines running
+        # Lines running (capacity adjustment)
         self.var_ossid_lines = tk.IntVar(value=6)
         self.var_repak_lines = tk.IntVar(value=1)
 
@@ -642,7 +693,69 @@ class App(tk.Tk):
         self._build_ui()
         self._log("Ready.")
         self._load_master(initial=True)
+        self._refresh_planned_listbox()
 
+    # ------------- planned shorts persistence -------------
+    def _txndate_key(self) -> str:
+        try:
+            return datetime.strptime(self.var_txndate.get().strip(), "%Y-%m-%d").date().isoformat()
+        except Exception:
+            return date.today().isoformat()
+
+    def _get_planned_set_for_date(self, key: str) -> set[str]:
+        d = self.cfg.planned_shorts or {}
+        items = d.get(key, []) if isinstance(d, dict) else []
+        out = set()
+        for x in items:
+            p = norm_plu(x)
+            if p:
+                out.add(p)
+        return out
+
+    def _set_planned_for_date(self, key: str, planned_set: set[str]):
+        if self.cfg.planned_shorts is None or not isinstance(self.cfg.planned_shorts, dict):
+            self.cfg.planned_shorts = {}
+        self.cfg.planned_shorts[key] = sorted(planned_set)
+
+        try:
+            save_config(self.cfg)
+            self._log(f"Planned shorts saved for {key}: {len(planned_set)} PLU(s).")
+        except Exception as e:
+            self._log(f"ERROR saving planned shorts: {e}")
+
+    def _refresh_planned_listbox(self):
+        key = self._txndate_key()
+        planned = sorted(self._get_planned_set_for_date(key))
+        self.lst_planned.delete(0, "end")
+        for p in planned:
+            self.lst_planned.insert("end", p)
+
+        # If we already have shortsheet detail loaded, update dashboard quickly
+        self._apply_planned_to_current_frames()
+        self.refresh_dashboard()
+
+    def _apply_planned_to_current_frames(self):
+        key = self._txndate_key()
+        planned = self._get_planned_set_for_date(key)
+
+        # Apply to detail frame
+        if self.last_shortsheets_detail is not None and not self.last_shortsheets_detail.empty:
+            d = self.last_shortsheets_detail.copy()
+            d["PLU"] = d["PLU"].astype(str).str.zfill(5)
+            d["Excluded"] = d["PLU"].isin(planned)
+            self.last_shortsheets_detail = d
+
+        # Apply to display frame
+        if self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty:
+            df = self.last_shortsheets_df.copy()
+            df["PLU"] = df["PLU"].astype(str).str.zfill(5)
+            if "Excluded" not in df.columns:
+                df["Excluded"] = False
+            df["Excluded"] = df["PLU"].isin(planned)
+            self.last_shortsheets_df = df
+            self.short_table.set_dataframe(df)
+
+    # ------------- UI / app -------------
     def _build_ui(self):
         topbar = ttk.Frame(self)
         topbar.pack(fill="x", padx=10, pady=(10, 6))
@@ -681,9 +794,12 @@ class App(tk.Tk):
         SettingsWindow(self, self.cfg, self._apply_settings)
 
     def _apply_settings(self, cfg: AppConfig):
+        # preserve planned shorts across save from popup
+        cfg.planned_shorts = self.cfg.planned_shorts or {}
         self.cfg = cfg
         self._log("Settings applied.")
         self._load_master(initial=True)
+        self._refresh_planned_listbox()
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -746,19 +862,21 @@ class App(tk.Tk):
         self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
         self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")
         self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COMPLETE", value_color="#ff2b2b")
+        self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
-        self.kpi_traypack.pack(side="left", padx=40)
-        self.kpi_traysmin.pack(side="left", padx=40)
+        self.kpi_traypack.pack(side="left", padx=30)
+        self.kpi_traysmin.pack(side="left", padx=30)
 
-        # shift/center with spacers
-        tk.Frame(row1, bg="#000000", width=80).pack(side="left")
+        tk.Frame(row1, bg="#000000", width=50).pack(side="left")
 
         self.block_traysmin_by_machine = DualRateBlock(row1, "TRAYS/MIN BY MACHINE")
         self.block_traysmin_by_machine.pack(side="left", padx=10)
 
-        tk.Frame(row1, bg="#000000", width=80).pack(side="left")
+        tk.Frame(row1, bg="#000000", width=50).pack(side="left")
 
-        self.kpi_trays_to_complete.pack(side="right", padx=40)
+        # right cluster
+        self.kpi_planned.pack(side="right", padx=30)
+        self.kpi_trays_to_complete.pack(side="right", padx=30)
 
         row2 = tk.Frame(root, bg="#000000")
         row2.pack(fill="x", padx=30, pady=(0, 10))
@@ -812,7 +930,6 @@ class App(tk.Tk):
         now = datetime.now()
         self.lbl_dash_time.configure(text=now.strftime("%m/%d/%Y %H:%M"))
 
-        # Lines running (capacity adjustment)
         ossid_lines = max(1, int(self.var_ossid_lines.get() or 1))
         repak_lines = max(1, int(self.var_repak_lines.get() or 1))
 
@@ -836,7 +953,7 @@ class App(tk.Tk):
             cases_completed_ossid = float(po["CasesProduced"].sum()) if not po.empty else 0.0
             cases_completed_repak = float(pr["CasesProduced"].sum()) if not pr.empty else 0.0
 
-        # Remaining totals (from shortsheet)
+        # Remaining totals (from shortsheet detail)
         trays_remaining_total = 0.0
         cases_remaining_total = 0.0
         trays_remaining_ossid = 0.0
@@ -844,35 +961,52 @@ class App(tk.Tk):
         cases_remaining_ossid = 0.0
         cases_remaining_repak = 0.0
 
+        # Planned shorts totals
+        planned_cases = 0.0
+        planned_trays = 0.0
+
         remain_detail = None
 
-        if (self.last_shortsheets_df is not None and not self.last_shortsheets_df.empty and
-                self.master_df is not None and not self.master_df.empty):
-            ss = self.last_shortsheets_df.copy()
-            m = self.master_df.copy()
-            ss["PLU"] = ss["PLU"].astype(str).str.zfill(5)
-            m["PLU"] = m["PLU"].astype(str).str.zfill(5)
+        if self.last_shortsheets_detail is not None and not self.last_shortsheets_detail.empty:
+            ss = self.last_shortsheets_detail.copy()
 
-            ss = ss.merge(m[["PLU", "Trays", "Machine", "TPM"]], on="PLU", how="left")
-            ss["Trays"] = pd.to_numeric(ss["Trays"], errors="coerce").fillna(0).astype(float)
-            ss["TPM"] = pd.to_numeric(ss["TPM"], errors="coerce").fillna(0).astype(float)
-            ss["RemainingCases"] = pd.to_numeric(ss["RemainingCases"], errors="coerce").fillna(0).astype(float)
+            ss["TraysPerCase"] = pd.to_numeric(ss.get("TraysPerCase", 0), errors="coerce").fillna(0).astype(float)
+            ss["StdTPM"] = pd.to_numeric(ss.get("StdTPM", 0), errors="coerce").fillna(0).astype(float)
+            ss["RemainingCases"] = pd.to_numeric(ss.get("RemainingCases", 0), errors="coerce").fillna(0).astype(float)
+
+            if "Machine" not in ss.columns:
+                ss["Machine"] = "Unknown"
             ss["Machine"] = ss["Machine"].fillna("Unknown").astype(str).str.strip()
 
-            ss["TraysRemaining"] = ss["RemainingCases"] * ss["Trays"]
+            if "Excluded" not in ss.columns:
+                ss["Excluded"] = False
+            ss["Excluded"] = ss["Excluded"].astype(bool)
 
-            trays_remaining_total = float(ss["TraysRemaining"].sum())
-            cases_remaining_total = float(ss["RemainingCases"].sum())
+            ss["TraysRemaining"] = ss["RemainingCases"] * ss["TraysPerCase"]
 
-            so = ss[ss["Machine"] == MACHINE_OSSID]
-            sr = ss[ss["Machine"] == MACHINE_REPAK]
+            # Planned short totals (always computed for KPI)
+            planned_df = ss[ss["Excluded"]].copy()
+            planned_cases = float(planned_df["RemainingCases"].sum()) if not planned_df.empty else 0.0
+            planned_trays = float(planned_df["TraysRemaining"].sum()) if not planned_df.empty else 0.0
+
+            # Apply exclusions to dashboard calculations (optional)
+            if bool(self.var_apply_planned_shorts.get()):
+                ss_calc = ss[~ss["Excluded"]].copy()
+            else:
+                ss_calc = ss.copy()
+
+            trays_remaining_total = float(ss_calc["TraysRemaining"].sum())
+            cases_remaining_total = float(ss_calc["RemainingCases"].sum())
+
+            so = ss_calc[ss_calc["Machine"] == MACHINE_OSSID]
+            sr = ss_calc[ss_calc["Machine"] == MACHINE_REPAK]
 
             trays_remaining_ossid = float(so["TraysRemaining"].sum()) if not so.empty else 0.0
             trays_remaining_repak = float(sr["TraysRemaining"].sum()) if not sr.empty else 0.0
             cases_remaining_ossid = float(so["RemainingCases"].sum()) if not so.empty else 0.0
             cases_remaining_repak = float(sr["RemainingCases"].sum()) if not sr.empty else 0.0
 
-            remain_detail = ss.copy()
+            remain_detail = ss_calc.copy()
 
         # Run minutes (from start -> now)
         run_mins = 0.0
@@ -904,6 +1038,11 @@ class App(tk.Tk):
 
         self.kpi_trays_to_complete.set_value(f"{trays_remaining_total:,.0f}" if trays_remaining_total > 0 else "—")
         self.kpi_cases_to_complete.set_value(f"{cases_remaining_total:,.0f}" if cases_remaining_total > 0 else "—")
+
+        if planned_cases > 0 or planned_trays > 0:
+            self.kpi_planned.set_value(f"{planned_cases:,.0f} cs\n{planned_trays:,.0f} tr")
+        else:
+            self.kpi_planned.set_value("—")
 
         ossid_txt = "—"
         repak_txt = "—"
@@ -947,13 +1086,12 @@ class App(tk.Tk):
             d = df[df["Machine"].astype(str).str.strip() == machine_code].copy()
             if d.empty:
                 return 0.0
-            d["TPM"] = pd.to_numeric(d["TPM"], errors="coerce").fillna(0).astype(float)
-            d["TraysRemaining"] = pd.to_numeric(d["TraysRemaining"], errors="coerce").fillna(0).astype(float)
-            d = d[(d["TPM"] > 0) & (d["TraysRemaining"] > 0)].copy()
+            d["StdTPM"] = pd.to_numeric(d.get("StdTPM", 0), errors="coerce").fillna(0).astype(float)
+            d["TraysRemaining"] = pd.to_numeric(d.get("TraysRemaining", 0), errors="coerce").fillna(0).astype(float)
+            d = d[(d["StdTPM"] > 0) & (d["TraysRemaining"] > 0)].copy()
             if d.empty:
                 return 0.0
-            # minutes if ONE line did all work
-            return float((d["TraysRemaining"] / d["TPM"]).sum())
+            return float((d["TraysRemaining"] / d["StdTPM"]).sum())
 
         if remain_detail is not None:
             std_mins_o_raw = standard_minutes_raw(remain_detail, MACHINE_OSSID)
@@ -1003,7 +1141,85 @@ class App(tk.Tk):
 
         self.lbl_warning.configure(text="\n".join(warn_lines) if warn_lines else "")
 
-    # ---------------- Shortsheet ----------------
+    # ---------------- Shortsheet actions ----------------
+    def on_txndate_changed(self, *_):
+        self._refresh_planned_listbox()
+
+    def on_planned_search(self):
+        q = (self.var_planned_search.get() or "").strip().lower()
+        if not q:
+            return
+
+        def pred(row):
+            plu = str(row.get("PLU", "")).lower()
+            desc = str(row.get("ProductDescription", "")).lower()
+            return (q in plu) or (q in desc)
+
+        found = self.short_table.select_first_match(pred)
+        if not found:
+            messagebox.showinfo("Search", "No match found.")
+
+    def on_planned_exclude_selected(self):
+        row = self.short_table.get_selected_values()
+        plu = norm_plu(row.get("PLU", ""))
+        if not plu:
+            messagebox.showinfo("Exclude", "Select a row (PLU) to exclude.")
+            return
+        key = self._txndate_key()
+        planned = self._get_planned_set_for_date(key)
+        planned.add(plu)
+        self._set_planned_for_date(key, planned)
+        self._refresh_planned_listbox()
+
+    def on_planned_include_selected(self):
+        row = self.short_table.get_selected_values()
+        plu = norm_plu(row.get("PLU", ""))
+        if not plu:
+            messagebox.showinfo("Include", "Select a row (PLU) to include back.")
+            return
+        key = self._txndate_key()
+        planned = self._get_planned_set_for_date(key)
+        if plu in planned:
+            planned.remove(plu)
+            self._set_planned_for_date(key, planned)
+            self._refresh_planned_listbox()
+
+    def on_planned_remove_from_list(self):
+        sel = self.lst_planned.curselection()
+        if not sel:
+            return
+        plu = norm_plu(self.lst_planned.get(sel[0]))
+        key = self._txndate_key()
+        planned = self._get_planned_set_for_date(key)
+        if plu in planned:
+            planned.remove(plu)
+            self._set_planned_for_date(key, planned)
+            self._refresh_planned_listbox()
+
+    def on_planned_clear_date(self):
+        key = self._txndate_key()
+        if messagebox.askyesno("Clear Planned Shorts", f"Clear all planned shorts for {key}?"):
+            self._set_planned_for_date(key, set())
+            self._refresh_planned_listbox()
+
+    def on_planned_bulk_apply(self):
+        raw = (self.var_planned_bulk.get() or "").strip()
+        if not raw:
+            return
+        tokens = []
+        for part in raw.replace(",", " ").replace("\n", " ").replace("\t", " ").split():
+            p = norm_plu(part)
+            if p:
+                tokens.append(p)
+        if not tokens:
+            messagebox.showinfo("Bulk", "No valid PLUs found in the bulk list.")
+            return
+        key = self._txndate_key()
+        planned = self._get_planned_set_for_date(key)
+        planned.update(tokens)
+        self._set_planned_for_date(key, planned)
+        self._refresh_planned_listbox()
+
     def on_run_shortsheets(self):
         if pyodbc is None:
             messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
@@ -1030,6 +1246,7 @@ class App(tk.Tk):
             if df.empty:
                 self._log("Shortsheet returned 0 rows.")
                 self.last_shortsheets_df = df
+                self.last_shortsheets_detail = df
                 self.short_table.set_dataframe(pd.DataFrame(columns=self.short_table.columns))
                 self.refresh_dashboard()
                 messagebox.showinfo("Shortsheet", "No remaining balances found.")
@@ -1037,6 +1254,7 @@ class App(tk.Tk):
 
             df2 = df.copy()
 
+            # Join master
             if self.master_df is not None and not self.master_df.empty:
                 m = self.master_df.copy()
                 df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
@@ -1046,25 +1264,47 @@ class App(tk.Tk):
             else:
                 df2["ProductDescription"] = ""
                 df2["TraysPerCase"] = None
+                df2["StdTPM"] = None
+                df2["Type"] = ""
+                df2["Machine"] = ""
                 df2["Frozen"] = ""
 
+            # Normalize
+            df2["TraysPerCase"] = pd.to_numeric(df2["TraysPerCase"], errors="coerce")
+            df2["StdTPM"] = pd.to_numeric(df2["StdTPM"], errors="coerce")
+            df2["Machine"] = df2["Machine"].fillna("Unknown").astype(str).str.strip()
+            df2["Frozen"] = df2["Frozen"].fillna("").astype(str).str.strip().str.upper()
+
+            # Apply master filters (requested)
             if exclude_missing and self.master_df is not None and not self.master_df.empty:
-                df2["TraysPerCase"] = pd.to_numeric(df2["TraysPerCase"], errors="coerce")
                 df2 = df2[df2["TraysPerCase"].notna()].copy()
 
             if exclude_frozen:
-                df2["Frozen"] = df2["Frozen"].astype(str).str.strip().str.upper()
                 df2 = df2[df2["Frozen"] != "Y"].copy()
 
-            show_cols = ["ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]
-            for c in show_cols:
-                if c not in df2.columns:
-                    df2[c] = ""
-            df2 = df2[show_cols]
+            # Planned shorts flag (by TxnDate)
+            key = txnd.isoformat()
+            planned_set = self._get_planned_set_for_date(key)
+            df2["Excluded"] = df2["PLU"].astype(str).str.zfill(5).isin(planned_set)
 
-            self.last_shortsheets_df = df2
-            self.short_table.set_dataframe(df2)
-            self._log(f"Shortsheet rows: {len(df2):,}")
+            # Detail frame for dashboard math
+            self.last_shortsheets_detail = df2[[
+                "ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases",
+                "RemainingCases", "TraysPerCase", "StdTPM", "Machine", "Type", "Frozen", "Excluded"
+            ]].copy()
+
+            # Display frame (add Excluded column so you can see planned shorts)
+            display = df2[[
+                "ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped",
+                "AvailableCases", "RemainingCases", "Excluded"
+            ]].copy()
+
+            self.last_shortsheets_df = display
+            self.short_table.set_dataframe(display)
+            self._log(f"Shortsheet rows: {len(display):,}")
+
+            # refresh planned list and dashboard
+            self._refresh_planned_listbox()
             self.refresh_dashboard()
         except Exception as e:
             self._log(f"ERROR shortsheet: {e}")
@@ -1144,7 +1384,6 @@ class App(tk.Tk):
             merged["LbsProduced"] = pd.to_numeric(merged["LbsProduced"], errors="coerce").fillna(0).astype(float)
 
             if self.cfg.exclude_missing_master:
-                # Consider missing master if trays per case is 0 (common if merge missed)
                 merged = merged[merged["TraysPerCase"] > 0].copy()
 
             if self.cfg.exclude_frozen_y:
@@ -1237,8 +1476,14 @@ class App(tk.Tk):
 
         r = 0
         ttk.Label(frm, text="TxnDate (YYYY-MM-DD):").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(frm, textvariable=self.var_txndate, width=16).grid(row=r, column=1, sticky="w", **pad)
+        ent_date = ttk.Entry(frm, textvariable=self.var_txndate, width=16)
+        ent_date.grid(row=r, column=1, sticky="w", **pad)
+        ent_date.bind("<FocusOut>", self.on_txndate_changed)
+        ent_date.bind("<Return>", self.on_txndate_changed)
+
         ttk.Checkbutton(frm, text="Only Remaining (>0)", variable=self.var_only_remaining).grid(row=r, column=2, sticky="w", **pad)
+        ttk.Checkbutton(frm, text="Apply Planned Shorts (exclude from totals/ETA)", variable=self.var_apply_planned_shorts,
+                        command=self.refresh_dashboard).grid(row=r, column=3, sticky="w", **pad)
 
         r += 1
         ttk.Label(frm, text="WIP statuses counted as AvailableCases:").grid(row=r, column=0, sticky="w", **pad)
@@ -1250,8 +1495,32 @@ class App(tk.Tk):
         ttk.Button(frm, text="Run Shortsheet", command=self.on_run_shortsheets).grid(row=r, column=0, sticky="w", **pad)
         ttk.Button(frm, text="Export Shortsheet Excel", command=self.on_export_shortsheets).grid(row=r, column=1, sticky="w", **pad)
 
+        # Planned shorts control panel
+        planned = ttk.LabelFrame(self.tab_short, text="Planned Shorts (Exclude specific PLUs from totals/ETA)")
+        planned.pack(fill="x", padx=10, pady=(0, 8))
+
+        ppad = {"padx": 10, "pady": 6}
+        ttk.Label(planned, text="Search (PLU or description):").grid(row=0, column=0, sticky="w", **ppad)
+        ttk.Entry(planned, textvariable=self.var_planned_search, width=28).grid(row=0, column=1, sticky="w", **ppad)
+        ttk.Button(planned, text="Find", command=self.on_planned_search).grid(row=0, column=2, sticky="w", **ppad)
+
+        ttk.Button(planned, text="Exclude Selected PLU", command=self.on_planned_exclude_selected).grid(row=0, column=3, sticky="w", **ppad)
+        ttk.Button(planned, text="Include Selected PLU", command=self.on_planned_include_selected).grid(row=0, column=4, sticky="w", **ppad)
+
+        ttk.Label(planned, text="Bulk add PLUs (comma/space/newline):").grid(row=1, column=0, sticky="w", **ppad)
+        ttk.Entry(planned, textvariable=self.var_planned_bulk, width=50).grid(row=1, column=1, columnspan=2, sticky="w", **ppad)
+        ttk.Button(planned, text="Apply Bulk", command=self.on_planned_bulk_apply).grid(row=1, column=3, sticky="w", **ppad)
+        ttk.Button(planned, text="Clear for TxnDate", command=self.on_planned_clear_date).grid(row=1, column=4, sticky="w", **ppad)
+
+        ttk.Label(planned, text="Excluded PLUs for TxnDate:").grid(row=0, column=5, sticky="w", **ppad)
+        self.lst_planned = tk.Listbox(planned, height=4, width=16)
+        self.lst_planned.grid(row=0, column=6, rowspan=2, sticky="w", padx=10, pady=6)
+        ttk.Button(planned, text="Remove Selected", command=self.on_planned_remove_from_list).grid(row=0, column=7, sticky="w", **ppad)
+
+        # Table
         self.short_table = TableView(self.tab_short, columns=[
-            "ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"
+            "ProductNumber", "PLU", "ProductDescription", "QtyOrdered", "QtyShipped",
+            "AvailableCases", "RemainingCases", "Excluded"
         ], height=14)
         self.short_table.pack(fill="both", expand=True, padx=10, pady=10)
 
