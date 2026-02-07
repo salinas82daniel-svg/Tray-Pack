@@ -334,6 +334,15 @@ def end_datetime_for_today(start_dt: datetime, end_t: time) -> datetime:
     return end_dt
 
 
+def fmt_duration_minutes(mins: float) -> str:
+    mins = max(0.0, float(mins))
+    h = int(mins // 60)
+    m = int(round(mins - (h * 60)))
+    if h <= 0:
+        return f"{m} min"
+    return f"{h} hr {m} min"
+
+
 # -----------------------------
 # UI helper: Treeview
 # -----------------------------
@@ -625,17 +634,13 @@ class CategoryDashboard(tk.Toplevel):
         sep = tk.Frame(self, bg="#00ff00", height=2)
         sep.pack(fill="x", padx=10, pady=(10, 10))
 
-        lbl = tk.Label(self, text="ESTIMATED TIME OF COMPLETION", bg="#000000", fg="#00ff00",
+        lbl = tk.Label(self, text="HOURS NEEDED (NOT A CLOCK TIME)", bg="#000000", fg="#00ff00",
                        font=("Segoe UI", 22, "bold"))
         lbl.pack(pady=(0, 8))
 
         self.lbl_estimates = tk.Label(self, text="—", bg="#000000", fg="#00ff00",
                                       font=("Segoe UI", 12, "bold"), justify="left")
         self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 6))
-
-        self.lbl_warning = tk.Label(self, text="", bg="#000000", fg="#ff2b2b",
-                                    font=("Segoe UI", 12, "bold"), justify="left")
-        self.lbl_warning.pack(anchor="w", padx=60, pady=(0, 10))
 
         ttk.Button(self, text="Refresh", command=self.refresh).pack(pady=8)
         self.refresh()
@@ -661,7 +666,6 @@ class CategoryDashboard(tk.Toplevel):
         self.kpi_cases_to_complete.set_value(data["cases_to_complete"])
 
         self.lbl_estimates.configure(text=data["estimates"])
-        self.lbl_warning.configure(text=data["warnings"])
 
 
 # -----------------------------
@@ -876,7 +880,6 @@ class App(tk.Tk):
                 return (t / tpm) / ossid_lines
             if row["Machine"] == MACHINE_REPAK:
                 return (t / tpm) / repak_lines
-            # unknown -> assume 1 line
             return (t / tpm)
 
         d["StdMinutes"] = d.apply(std_minutes_row, axis=1)
@@ -894,7 +897,6 @@ class App(tk.Tk):
         self.lbl_dash_time = tk.Label(root, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 10, "bold"))
         self.lbl_dash_time.place(relx=0.98, rely=0.02, anchor="ne")
 
-        # Category buttons
         btns = tk.Frame(root, bg="#000000")
         btns.pack(fill="x", padx=10, pady=(10, 0))
         tk.Label(btns, text="Category Dashboards:", bg="#000000", fg="#00ff00",
@@ -907,15 +909,13 @@ class App(tk.Tk):
         row1.pack(fill="x", padx=30, pady=(15, 10))
 
         self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
-        self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")
+        self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")  # overall trays/min stays on main page
         self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COMPLETE", value_color="#ff2b2b")
         self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
         self.kpi_traypack.pack(side="left", padx=30)
         self.kpi_traysmin.pack(side="left", padx=30)
-
         tk.Frame(row1, bg="#000000", width=50).pack(side="left")
-
         self.kpi_planned.pack(side="right", padx=30)
         self.kpi_trays_to_complete.pack(side="right", padx=30)
 
@@ -971,9 +971,15 @@ class App(tk.Tk):
 
     def compute_dashboard_payload(self, fed_filter: str | None = None) -> dict:
         """
-        - For fed_filter dashboards: DO NOT compute trays/min from that category (no category-specific time window).
-          Instead, use OVERALL plant rates (overall OSSID/REPAK) to estimate category completion.
-        - Standard time is computed from RemainingTrays / StdTPM / lines_running.
+        MAIN page (fed_filter None):
+          - keep overall trays/min KPI
+          - show trays/min by machine inside estimate block (OSSID + REPAK)
+          - show projected finish clock times (like before)
+
+        FED popups (fed_filter set):
+          - DO NOT show "finish at 14:32" (because we may not run that category continuously)
+          - Instead show only: "Hours needed at current overall rate" + "Hours needed at standard"
+          - (still broken down by machine, using OVERALL machine rates)
         """
         now = datetime.now()
 
@@ -992,6 +998,7 @@ class App(tk.Tk):
 
         # --- Production totals (overall and optionally category-filtered for "completed" KPIs) ---
         prod_df = self.last_production_df
+
         trays_completed_total = 0.0
         cases_completed_total = 0.0
         trays_completed_ossid = 0.0
@@ -999,6 +1006,7 @@ class App(tk.Tk):
         cases_completed_ossid = 0.0
         cases_completed_repak = 0.0
 
+        # Always compute ALL for rates
         trays_completed_total_all = 0.0
         trays_completed_ossid_all = 0.0
         trays_completed_repak_all = 0.0
@@ -1011,7 +1019,6 @@ class App(tk.Tk):
             trays_completed_ossid_all = float(po_all.get("TraysProduced", 0).sum()) if not po_all.empty else 0.0
             trays_completed_repak_all = float(pr_all.get("TraysProduced", 0).sum()) if not pr_all.empty else 0.0
 
-            # For category dashboards, "completed" KPIs can be filtered, but rates must stay overall.
             p = p_all
             if fed_filter:
                 p = p[p.get("Fed", "").fillna("").astype(str).str.strip() == fed_filter].copy()
@@ -1026,14 +1033,13 @@ class App(tk.Tk):
             cases_completed_ossid = float(po.get("CasesProduced", 0).sum()) if not po.empty else 0.0
             cases_completed_repak = float(pr.get("CasesProduced", 0).sum()) if not pr.empty else 0.0
 
-        # Overall actual rates (used for ALL estimates, especially Fed dashboards)
+        # Actual rates (overall + machine) based on ALL production
         trays_per_min_all = (trays_completed_total_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_ossid_all = (trays_completed_ossid_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_repak_all = (trays_completed_repak_all / run_mins) if run_mins > 0 else 0.0
 
-        # Main dashboard actual trays/min shown only when fed_filter is None
-        trays_per_min_display = (trays_completed_total / run_mins) if (run_mins > 0 and not fed_filter) else 0.0
-        cases_per_min_display = (cases_completed_total / run_mins) if (run_mins > 0 and not fed_filter) else 0.0
+        trays_per_min_display = (trays_completed_total / run_mins) if run_mins > 0 else 0.0
+        cases_per_min_display = (cases_completed_total / run_mins) if run_mins > 0 else 0.0
 
         # --- Remaining (shortsheet) ---
         trays_remaining_total = 0.0
@@ -1097,48 +1103,74 @@ class App(tk.Tk):
         std_repak_min = std["repak"]
         std_total_min = std["total"]
 
-        # --- Estimates: ACTUAL uses OVERALL rates ---
+        # --- Build estimates (REVERT STYLE FOR MAIN; HOURS-ONLY FOR FED) ---
         lines = []
         warn_lines = []
 
-        def fmt_actual(machine_name: str, remain_trays: float, rate_total: float):
-            if remain_trays <= 0:
-                return f"{machine_name} ACTUAL -> No remaining trays."
-            if rate_total <= 0:
-                return f"{machine_name} ACTUAL -> Need Production + Start time to calculate rate."
-            mins = remain_trays / rate_total
-            finish = now + timedelta(minutes=mins)
-            return f"{machine_name} ACTUAL -> {rate_total:,.2f} trays/min | Est: {mins/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}"
+        if fed_filter:
+            # FED POPUP: show "hours needed" only
+            lines.append(f"Rate basis: OVERALL performance (not category-specific)")
+            lines.append("")
+            lines.append(f"CURRENT RATE (OSSID): {trays_per_min_ossid_all:,.2f} trays/min")
+            lines.append(f"CURRENT RATE (REPAK): {trays_per_min_repak_all:,.2f} trays/min")
+            lines.append(f"CURRENT RATE (TOTAL): {trays_per_min_all:,.2f} trays/min")
+            lines.append("")
 
-        def fmt_standard(machine_name: str, std_minutes: float):
-            if std_minutes <= 0:
-                return f"{machine_name} STANDARD -> (Need StdTPM in Product Info + Remaining trays)"
-            finish = now + timedelta(minutes=std_minutes)
-            return f"{machine_name} STANDARD -> Est: {std_minutes/60:,.2f} hrs | Finish: {finish.strftime('%H:%M')}"
+            def hours_needed(rem_trays: float, rate: float) -> str:
+                if rem_trays <= 0:
+                    return "0 min"
+                if rate <= 0:
+                    return "Need Production + Start time"
+                return fmt_duration_minutes(rem_trays / rate)
 
-        lines.append(fmt_actual("OSSID", trays_remaining_ossid, trays_per_min_ossid_all))
-        lines.append(fmt_standard("OSSID", std_ossid_min))
-        lines.append("")
-        lines.append(fmt_actual("REPAK", trays_remaining_repak, trays_per_min_repak_all))
-        lines.append(fmt_standard("REPAK", std_repak_min))
-        lines.append("")
-        lines.append(fmt_actual("TOTAL", trays_remaining_total, trays_per_min_all))
-        lines.append(fmt_standard("TOTAL", std_total_min))
+            lines.append(f"OSSID remaining trays: {trays_remaining_ossid:,.0f} -> {hours_needed(trays_remaining_ossid, trays_per_min_ossid_all)}")
+            lines.append(f"REPAK remaining trays: {trays_remaining_repak:,.0f} -> {hours_needed(trays_remaining_repak, trays_per_min_repak_all)}")
+            lines.append(f"TOTAL remaining trays: {trays_remaining_total:,.0f} -> {hours_needed(trays_remaining_total, trays_per_min_all)}")
+            lines.append("")
+            lines.append("STANDARD (based on StdTPM + lines running):")
+            lines.append(f"OSSID standard time: {fmt_duration_minutes(std_ossid_min)}")
+            lines.append(f"REPAK standard time: {fmt_duration_minutes(std_repak_min)}")
+            lines.append(f"TOTAL standard time: {fmt_duration_minutes(std_total_min)}")
 
-        # --- Warnings vs end time (use ACTUAL) ---
-        if start_dt is not None and end_dt is not None:
-            if trays_remaining_ossid > 0 and trays_per_min_ossid_all > 0:
-                finish_o = now + timedelta(minutes=(trays_remaining_ossid / trays_per_min_ossid_all))
-                if finish_o > end_dt:
-                    warn_lines.append(f"⚠ OSSID projected finish {finish_o.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
-            if trays_remaining_repak > 0 and trays_per_min_repak_all > 0:
-                finish_r = now + timedelta(minutes=(trays_remaining_repak / trays_per_min_repak_all))
-                if finish_r > end_dt:
-                    warn_lines.append(f"⚠ REPAK projected finish {finish_r.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
-            if trays_remaining_total > 0 and trays_per_min_all > 0:
-                finish_t = now + timedelta(minutes=(trays_remaining_total / trays_per_min_all))
-                if finish_t > end_dt:
-                    warn_lines.append(f"⚠ TOTAL projected finish {finish_t.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
+        else:
+            # MAIN PAGE: show finish times + include trays/min by machine (the “fun stuff”)
+            end_txt = end_dt.strftime("%H:%M") if end_dt else "—"
+            start_txt = start_dt.strftime("%H:%M") if start_dt else "—"
+            lines.append(f"Start: {start_txt} | End: {end_txt} | Run mins so far: {run_mins:,.0f}")
+            lines.append(f"Trays/min (TOTAL): {trays_per_min_all:,.2f} | OSSID: {trays_per_min_ossid_all:,.2f} | REPAK: {trays_per_min_repak_all:,.2f}")
+            lines.append("")
+
+            def fmt_finish(machine_name: str, rem_trays: float, rate: float, std_min: float):
+                if rem_trays <= 0:
+                    return f"{machine_name}: no remaining trays."
+                if rate <= 0:
+                    return f"{machine_name}: need Production + Start time to estimate."
+                mins_needed = rem_trays / rate
+                finish = now + timedelta(minutes=mins_needed)
+                return (
+                    f"{machine_name}: Remaining {rem_trays:,.0f} trays | "
+                    f"Est {fmt_duration_minutes(mins_needed)} | Finish {finish.strftime('%H:%M')} | "
+                    f"Standard {fmt_duration_minutes(std_min)}"
+                )
+
+            lines.append(fmt_finish("OSSID", trays_remaining_ossid, trays_per_min_ossid_all, std_ossid_min))
+            lines.append(fmt_finish("REPAK", trays_remaining_repak, trays_per_min_repak_all, std_repak_min))
+            lines.append(fmt_finish("TOTAL", trays_remaining_total, trays_per_min_all, std_total_min))
+
+            # Warnings vs end time (use ACTUAL)
+            if start_dt is not None and end_dt is not None:
+                if trays_remaining_ossid > 0 and trays_per_min_ossid_all > 0:
+                    finish_o = now + timedelta(minutes=(trays_remaining_ossid / trays_per_min_ossid_all))
+                    if finish_o > end_dt:
+                        warn_lines.append(f"⚠ OSSID projected finish {finish_o.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
+                if trays_remaining_repak > 0 and trays_per_min_repak_all > 0:
+                    finish_r = now + timedelta(minutes=(trays_remaining_repak / trays_per_min_repak_all))
+                    if finish_r > end_dt:
+                        warn_lines.append(f"⚠ REPAK projected finish {finish_r.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
+                if trays_remaining_total > 0 and trays_per_min_all > 0:
+                    finish_t = now + timedelta(minutes=(trays_remaining_total / trays_per_min_all))
+                    if finish_t > end_dt:
+                        warn_lines.append(f"⚠ TOTAL projected finish {finish_t.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
 
         # --- Render payload ---
         def fmt_kpi(v, decimals=0):
@@ -1152,7 +1184,7 @@ class App(tk.Tk):
 
         return {
             "tray_pack": fmt_kpi(trays_completed_total, 0),
-            "trays_min": fmt_kpi(trays_per_min_display, 2) if not fed_filter else "—",
+            "trays_min": fmt_kpi(trays_per_min_all, 2) if trays_per_min_all > 0 else "—",
             "trays_to_complete": fmt_kpi(trays_remaining_total, 0),
             "planned": planned_txt,
             "trays_done_o": fmt_kpi(trays_completed_ossid, 0),
@@ -1160,7 +1192,7 @@ class App(tk.Tk):
             "trays_rem_o": fmt_kpi(trays_remaining_ossid, 0),
             "trays_rem_r": fmt_kpi(trays_remaining_repak, 0),
             "tp_cases": fmt_kpi(cases_completed_total, 0),
-            "cases_min": fmt_kpi(cases_per_min_display, 2) if not fed_filter else "—",
+            "cases_min": fmt_kpi(cases_per_min_display, 2) if (cases_per_min_display > 0 and not fed_filter) else ("—" if fed_filter else "—"),
             "cases_to_complete": fmt_kpi(cases_remaining_total, 0),
             "cases_done_o": fmt_kpi(cases_completed_ossid, 0),
             "cases_done_r": fmt_kpi(cases_completed_repak, 0),
@@ -1178,7 +1210,7 @@ class App(tk.Tk):
             return
 
         self.kpi_traypack.set_value(payload["tray_pack"])
-        self.kpi_traysmin.set_value(payload["trays_min"])
+        self.kpi_traysmin.set_value(payload["trays_min"])  # stays on main
         self.kpi_trays_to_complete.set_value(payload["trays_to_complete"])
         self.kpi_planned.set_value(payload["planned"])
 
