@@ -1,3 +1,4 @@
+# app.py
 import json
 import os
 import traceback
@@ -17,12 +18,11 @@ except ImportError:
 APP_NAME = "ShortsheetBuilder"
 CONFIG_FILE = "config.json"
 
-# Machine mapping (your rule)
 MACHINE_OSSID = "O"
 MACHINE_REPAK = "R"
 
-# Fed sort order (custom)
-FED_ORDER = ["Organic", "ABF", "Heirloom", "Legacy", "NGMO", "Frozen", "Duck", "Halal"]
+# If you want a custom Fed sort order, edit this list
+FED_ORDER = ["Organic", "ABF", "Heirloom", "Legacy", "NGMO"]
 
 
 # -----------------------------
@@ -37,14 +37,10 @@ class AppConfig:
     username: str = ""
     password: str = ""
     product_excel_path: str = "Product Info.xlsx"
-    product_sheet_name: str = ""
     output_folder: str = ""
     exclude_missing_master: bool = True
     exclude_frozen_y: bool = False
-
-    # Planned shorts persisted by TxnDate RANGE key -> ["00123","04567",...]
-    # Range key format: YYYY-MM-DD__YYYY-MM-DD
-    planned_shorts: dict = field(default_factory=dict)
+    planned_shorts: dict = field(default_factory=dict)  # rangeKey -> [PLU,...]
 
 
 def load_config() -> AppConfig:
@@ -67,7 +63,7 @@ def save_config(cfg: AppConfig) -> None:
 
 
 # -----------------------------
-# SQL helpers
+# SQL + ODBC helpers
 # -----------------------------
 def list_odbc_drivers() -> list[str]:
     if pyodbc is None:
@@ -76,10 +72,11 @@ def list_odbc_drivers() -> list[str]:
         drivers = pyodbc.drivers()
         preferred, other = [], []
         for d in drivers:
-            if "SQL Server" in d or "ODBC Driver" in d:
+            if "SQL Server" in d or "ODBC Driver" in d or "Native Client" in d:
                 preferred.append(d)
             else:
                 other.append(d)
+        # newest-ish first for preferred
         return preferred[::-1] + other
     except Exception:
         return []
@@ -92,7 +89,7 @@ def build_connection_string(cfg: AppConfig) -> str:
         raise ValueError("Server Address is blank.")
 
     base = f"DRIVER={{{cfg.driver}}};SERVER={cfg.server};DATABASE={cfg.database};"
-    if cfg.auth_mode == "windows":
+    if cfg.auth_mode.strip().lower() == "windows":
         return base + "Trusted_Connection=yes;"
     else:
         if not cfg.username:
@@ -123,6 +120,7 @@ def _build_in_list_sql(values: list[str]) -> str:
 
 
 def sql_int_expr(col_name: str) -> str:
+    # works on older SQL Server (no TRY_CONVERT)
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS INT) ELSE NULL END)"
 
 
@@ -152,15 +150,11 @@ def norm_plu(s: str) -> str:
 # -----------------------------
 # Product master
 # -----------------------------
-def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
+def load_product_master(path: str) -> pd.DataFrame:
     if not path or not os.path.exists(path):
         return pd.DataFrame()
 
-    if sheet_name.strip():
-        df = pd.read_excel(path, sheet_name=sheet_name.strip())
-    else:
-        df = pd.read_excel(path)
-
+    df = pd.read_excel(path)
     df.columns = [str(c).strip() for c in df.columns]
 
     if "PLU" not in df.columns:
@@ -168,20 +162,10 @@ def load_product_master(path: str, sheet_name: str = "") -> pd.DataFrame:
 
     df["PLU"] = df["PLU"].astype(str).str.strip().str.zfill(5)
 
-    if "DESC" in df.columns:
-        df["DESC"] = df["DESC"].astype(str).fillna("")
-    else:
-        df["DESC"] = ""
-
-    if "Trays" in df.columns:
-        df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float)
-    else:
-        df["Trays"] = 0.0
-
-    if "TPM" in df.columns:
-        df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float)
-    else:
-        df["TPM"] = 0.0
+    # normalize common columns you’ve been using
+    df["DESC"] = df["DESC"].astype(str).fillna("") if "DESC" in df.columns else ""
+    df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float) if "Trays" in df.columns else 0.0
+    df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float) if "TPM" in df.columns else 0.0
 
     df["Machine"] = df["Machine"].astype(str).str.strip() if "Machine" in df.columns else ""
     df["Type"] = df["Type"].astype(str).str.strip() if "Type" in df.columns else ""
@@ -200,13 +184,11 @@ def product_machines(master_df: pd.DataFrame) -> list[str]:
 
 
 # -----------------------------
-# Shortsheet SQL (TxnDate RANGE)
-# Remaining = Ordered - Shipped - AvailableCases
+# SQL queries
 # -----------------------------
 def fetch_shortsheets_range(conn, from_date: date, to_date: date, wip_statuses: list[str], only_remaining: bool) -> pd.DataFrame:
     if not wip_statuses:
         wip_statuses = ["Available"]
-
     if to_date < from_date:
         from_date, to_date = to_date, from_date
 
@@ -278,13 +260,9 @@ def fetch_shortsheets_range(conn, from_date: date, to_date: date, wip_statuses: 
     df["PLU"] = df["PLU_Int"].astype(int).astype(str).str.zfill(5)
     df = df.drop(columns=["PLU_Int"])
     df["RemainingCases"] = df["RemainingCases"].apply(lambda x: x if safe_float(x) > 0 else 0)
-
     return df[["ProductNumber", "PLU", "QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]]
 
 
-# -----------------------------
-# Production SQL (PackDate) includes Shipped
-# -----------------------------
 def fetch_production_by_packdate(conn, packdate_value, statuses: list[str]) -> pd.DataFrame:
     if not statuses:
         statuses = ["Available", "ScanningSalesOrder", "WaitingToBeInvoiced", "Shipped"]
@@ -344,7 +322,7 @@ def fmt_duration_minutes(mins: float) -> str:
 
 
 # -----------------------------
-# UI helper: Treeview (scrollable)
+# UI widgets
 # -----------------------------
 class TableView(ttk.Frame):
     def __init__(self, parent, columns: list[str], height: int = 12):
@@ -366,18 +344,15 @@ class TableView(ttk.Frame):
             self.tree.heading(c, text=c)
             self.tree.column(c, width=140, anchor="w")
 
-        # Mousewheel support when pointer is over table
         self.tree.bind("<Enter>", lambda e: self.tree.bind_all("<MouseWheel>", self._on_mousewheel))
         self.tree.bind("<Leave>", lambda e: self.tree.unbind_all("<MouseWheel>"))
 
     def _on_mousewheel(self, event):
-        # Windows: event.delta is 120 increments
         self.tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def set_dataframe(self, df: pd.DataFrame):
         for item in self.tree.get_children():
             self.tree.delete(item)
-
         if df is None or df.empty:
             return
 
@@ -414,9 +389,6 @@ class TableView(ttk.Frame):
         return False
 
 
-# -----------------------------
-# Dashboard widgets
-# -----------------------------
 class KpiBlock(tk.Frame):
     def __init__(self, parent, title: str, value_color="#00ff00"):
         super().__init__(parent, bg="#000000")
@@ -450,11 +422,8 @@ class RatioBlock(tk.Frame):
         self.repak.configure(text=repak_val)
 
 
-# -----------------------------
-# Settings popup
-# -----------------------------
 class SettingsWindow(tk.Toplevel):
-    def __init__(self, parent, cfg, on_apply_callback):
+    def __init__(self, parent, cfg: AppConfig, on_apply_callback):
         super().__init__(parent)
         self.title("Settings")
         self.resizable(False, False)
@@ -531,7 +500,6 @@ class SettingsWindow(tk.Toplevel):
         r += 1
         btns = ttk.Frame(frm)
         btns.grid(row=r, column=0, columnspan=4, sticky="e", padx=10, pady=(10, 0))
-
         ttk.Button(btns, text="Test Connection", command=self._test_connection).pack(side="left", padx=8)
         ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=8)
         ttk.Button(btns, text="Close", command=self.destroy).pack(side="left", padx=8)
@@ -557,14 +525,6 @@ class SettingsWindow(tk.Toplevel):
         if folder:
             self.var_output_folder.set(folder)
 
-    def _test_connection(self):
-        cfg = self._build_cfg()
-        ok, msg = test_connection(cfg)
-        if ok:
-            messagebox.showinfo("Connection", msg, parent=self)
-        else:
-            messagebox.showerror("Connection", msg, parent=self)
-
     def _build_cfg(self) -> AppConfig:
         return AppConfig(
             server=self.var_server.get().strip(),
@@ -580,6 +540,14 @@ class SettingsWindow(tk.Toplevel):
             planned_shorts={},  # replaced on apply
         )
 
+    def _test_connection(self):
+        cfg = self._build_cfg()
+        ok, msg = test_connection(cfg)
+        if ok:
+            messagebox.showinfo("Connection", msg, parent=self)
+        else:
+            messagebox.showerror("Connection", msg, parent=self)
+
     def _save(self):
         cfg = self._build_cfg()
         cfg.planned_shorts = getattr(self.master, "cfg", AppConfig()).planned_shorts or {}
@@ -591,10 +559,10 @@ class SettingsWindow(tk.Toplevel):
             messagebox.showerror("Settings", str(e), parent=self)
 
 
-# -----------------------------
-# Category Dashboard (popup)
-# -----------------------------
 class CategoryDashboard(tk.Toplevel):
+    """
+    Category window shows HOURS NEEDED (not clock time), because category-specific time window is unknown.
+    """
     def __init__(self, parent, title: str, compute_callback):
         super().__init__(parent)
         self.title(title)
@@ -609,7 +577,7 @@ class CategoryDashboard(tk.Toplevel):
         row1.pack(fill="x", padx=30, pady=(25, 10))
 
         self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
-        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COMPLETE", value_color="#ff2b2b")
+        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COM", value_color="#ff2b2b")
         self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
         self.kpi_traypack.pack(side="left", padx=30)
@@ -628,7 +596,7 @@ class CategoryDashboard(tk.Toplevel):
         row3.pack(fill="x", padx=30, pady=(10, 10))
 
         self.kpi_tpcases = KpiBlock(row3, "TP CASES")
-        self.kpi_cases_to_complete = KpiBlock(row3, "CASES TO COMPLETE", value_color="#ff2b2b")
+        self.kpi_cases_to_complete = KpiBlock(row3, "CASES TO COM", value_color="#ff2b2b")
         self.kpi_tpcases.pack(side="left", padx=40)
         self.kpi_cases_to_complete.pack(side="right", padx=40)
 
@@ -647,8 +615,8 @@ class CategoryDashboard(tk.Toplevel):
         lbl.pack(pady=(0, 8))
 
         self.lbl_estimates = tk.Label(self, text="—", bg="#000000", fg="#00ff00",
-                                      font=("Segoe UI", 12, "bold"), justify="left")
-        self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 6))
+                                      font=("Segoe UI", 12, "bold"), justify="left", anchor="w")
+        self.lbl_estimates.pack(fill="x", anchor="w", padx=60, pady=(0, 6))
 
         ttk.Button(self, text="Refresh", command=self.refresh).pack(pady=8)
         self.refresh()
@@ -720,15 +688,11 @@ class App(tk.Tk):
         self._refresh_planned_listbox()
 
     # -----------------------------
-    # Excel export helpers
+    # Excel export
     # -----------------------------
     def _choose_export_path(self, default_name: str) -> str:
         folder = (self.cfg.output_folder or "").strip()
-        if folder and os.path.isdir(folder):
-            initialdir = folder
-        else:
-            initialdir = os.getcwd()
-
+        initialdir = folder if folder and os.path.isdir(folder) else os.getcwd()
         path = filedialog.asksaveasfilename(
             title="Save Excel File",
             initialdir=initialdir,
@@ -741,12 +705,9 @@ class App(tk.Tk):
     def _export_df_to_excel(self, df: pd.DataFrame, path: str, sheet_name: str = "Data"):
         if df is None or df.empty:
             raise ValueError("Nothing to export (data is empty).")
-
         out = df.copy()
-
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             out.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-
         try:
             self.cfg.output_folder = os.path.dirname(path)
             save_config(self.cfg)
@@ -758,7 +719,6 @@ class App(tk.Tk):
         if df is None or df.empty:
             messagebox.showinfo("Export Shortsheet", "Run the shortsheet first (no data to export).")
             return
-
         from_d, to_d = self._parse_txn_from_to()
         name = f"Shortsheet_{from_d.isoformat()}_to_{to_d.isoformat()}.xlsx"
         path = self._choose_export_path(name)
@@ -777,7 +737,6 @@ class App(tk.Tk):
         if df is None or df.empty:
             messagebox.showinfo("Export Production", "Refresh Production first (no data to export).")
             return
-
         pack = (self.var_packdate.get() or "").strip() or "packdate"
         name = f"Production_{pack}.xlsx"
         path = self._choose_export_path(name)
@@ -791,7 +750,6 @@ class App(tk.Tk):
             out = df.copy()
             export_cols = [c for c in export_cols if c in out.columns]
             out = out[export_cols] if export_cols else out
-
             self._export_df_to_excel(out, path, sheet_name="Production")
             self._log(f"Exported production: {path}")
             messagebox.showinfo("Export Production", "Export complete.")
@@ -799,7 +757,9 @@ class App(tk.Tk):
             self._log(f"ERROR exporting production: {e}")
             messagebox.showerror("Export Production", str(e))
 
-    # ------------- planned shorts persistence (range key) -------------
+    # -----------------------------
+    # Planned shorts persistence
+    # -----------------------------
     def _parse_txn_from_to(self) -> tuple[date, date]:
         d1 = datetime.strptime(self.var_txn_from.get().strip(), "%Y-%m-%d").date()
         d2 = datetime.strptime(self.var_txn_to.get().strip(), "%Y-%m-%d").date()
@@ -818,12 +778,7 @@ class App(tk.Tk):
     def _get_planned_set_for_range(self, key: str) -> set[str]:
         d = self.cfg.planned_shorts or {}
         items = d.get(key, []) if isinstance(d, dict) else []
-        out = set()
-        for x in items:
-            p = norm_plu(x)
-            if p:
-                out.add(p)
-        return out
+        return {norm_plu(x) for x in items if norm_plu(x)}
 
     def _set_planned_for_range(self, key: str, planned_set: set[str]):
         if self.cfg.planned_shorts is None or not isinstance(self.cfg.planned_shorts, dict):
@@ -838,7 +793,6 @@ class App(tk.Tk):
         self.lst_planned.delete(0, "end")
         for p in planned:
             self.lst_planned.insert("end", p)
-
         self._apply_planned_to_current_frames()
         self.refresh_dashboard()
 
@@ -859,11 +813,12 @@ class App(tk.Tk):
             self.last_shortsheets_df = df
             self.short_table.set_dataframe(df)
 
-    # ------------- UI -------------
+    # -----------------------------
+    # UI scaffold
+    # -----------------------------
     def _build_ui(self):
         topbar = ttk.Frame(self)
         topbar.pack(fill="x", padx=10, pady=(10, 6))
-
         ttk.Button(topbar, text="⚙ Settings…", command=self.open_settings).pack(side="left")
         ttk.Label(topbar, text="   ").pack(side="left")
         ttk.Button(topbar, text="Refresh Dashboard", command=self.refresh_dashboard).pack(side="left")
@@ -888,6 +843,12 @@ class App(tk.Tk):
         self.txt_log = tk.Text(frm_log, height=8, wrap="word")
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=10)
 
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.txt_log.insert("end", f"[{ts}] {msg}\n")
+        self.txt_log.see("end")
+        self.update_idletasks()
+
     def open_settings(self):
         SettingsWindow(self, self.cfg, self._apply_settings)
 
@@ -897,22 +858,6 @@ class App(tk.Tk):
         self._log("Settings applied.")
         self._load_master(initial=True)
         self._refresh_planned_listbox()
-
-    def _log(self, msg: str):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.txt_log.insert("end", f"[{ts}] {msg}\n")
-        self.txt_log.see("end")
-        self.update_idletasks()
-
-    def _get_short_wip_statuses(self) -> list[str]:
-        statuses = []
-        if self.var_wip_available.get():
-            statuses.append("Available")
-        if self.var_wip_scanning.get():
-            statuses.append("ScanningSalesOrder")
-        if self.var_wip_waiting.get():
-            statuses.append("WaitingToBeInvoiced")
-        return statuses or ["Available"]
 
     def _load_master(self, initial: bool = False):
         try:
@@ -927,7 +872,7 @@ class App(tk.Tk):
                 return
 
             self._log(f"Loading product master: {path}")
-            self.master_df = load_product_master(path, "")
+            self.master_df = load_product_master(path)
             self._log(f"Loaded product master rows: {len(self.master_df):,}")
 
             machines = product_machines(self.master_df)
@@ -942,12 +887,20 @@ class App(tk.Tk):
             if not initial:
                 messagebox.showerror("Product Master Error", str(e))
 
-    # ---------------- Standard time calculation ----------------
+    def _get_short_wip_statuses(self) -> list[str]:
+        statuses = []
+        if self.var_wip_available.get():
+            statuses.append("Available")
+        if self.var_wip_scanning.get():
+            statuses.append("ScanningSalesOrder")
+        if self.var_wip_waiting.get():
+            statuses.append("WaitingToBeInvoiced")
+        return statuses or ["Available"]
+
+    # -----------------------------
+    # Standard minutes calc
+    # -----------------------------
     def compute_standard_minutes(self, remain_df: pd.DataFrame) -> dict:
-        """
-        remain_df must have: Machine, TraysRemaining, StdTPM
-        Standard time uses per-line StdTPM, divided by number of lines running for that machine.
-        """
         ossid_lines = max(1, int(self.var_ossid_lines.get() or 1))
         repak_lines = max(1, int(self.var_repak_lines.get() or 1))
 
@@ -960,15 +913,15 @@ class App(tk.Tk):
         d["StdTPM"] = pd.to_numeric(d.get("StdTPM", 0), errors="coerce").fillna(0).astype(float)
 
         def std_minutes_row(row):
-            t = float(row["TraysRemaining"])
+            trays = float(row["TraysRemaining"])
             tpm = float(row["StdTPM"])
-            if t <= 0 or tpm <= 0:
+            if trays <= 0 or tpm <= 0:
                 return 0.0
             if row["Machine"] == MACHINE_OSSID:
-                return (t / tpm) / ossid_lines
+                return (trays / tpm) / ossid_lines
             if row["Machine"] == MACHINE_REPAK:
-                return (t / tpm) / repak_lines
-            return (t / tpm)
+                return (trays / tpm) / repak_lines
+            return trays / tpm
 
         d["StdMinutes"] = d.apply(std_minutes_row, axis=1)
 
@@ -977,10 +930,34 @@ class App(tk.Tk):
         total = float(d["StdMinutes"].sum())
         return {"ossid": ossid, "repak": repak, "total": total}
 
-    # ---------------- Dashboard ----------------
+    # -----------------------------
+    # Dashboard
+    # -----------------------------
     def _build_tab_dashboard(self):
-        root = tk.Frame(self.tab_dash, bg="#000000")
-        root.pack(fill="both", expand=True)
+        # Make dashboard scrollable (fixes bottom cutoff)
+        canvas = tk.Canvas(self.tab_dash, bg="#000000", highlightthickness=0)
+        vscroll = ttk.Scrollbar(self.tab_dash, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        root = tk.Frame(canvas, bg="#000000")
+        root_id = canvas.create_window((0, 0), window=root, anchor="nw")
+
+        def _on_root_configure(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(root_id, width=event.width)
+
+        root.bind("<Configure>", _on_root_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         self.lbl_dash_time = tk.Label(root, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 10, "bold"))
         self.lbl_dash_time.place(relx=0.98, rely=0.02, anchor="ne")
@@ -997,23 +974,24 @@ class App(tk.Tk):
         row1.pack(fill="x", padx=30, pady=(15, 10))
 
         self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
-        self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")  # overall trays/min
+        self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")
         self.kpi_avg_ossid = KpiBlock(row1, "AVG TPM/LINE (O)")
         self.kpi_avg_repak = KpiBlock(row1, "AVG TPM/LINE (R)")
-        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COMPLETE", value_color="#ff2b2b")
+        # shortened titles (fix cut-off)
+        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COM", value_color="#ff2b2b")
         self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
-        self.kpi_traypack.pack(side="left", padx=30)
-        self.kpi_traysmin.pack(side="left", padx=30)
-        self.kpi_avg_ossid.pack(side="left", padx=30)
-        self.kpi_avg_repak.pack(side="left", padx=30)
-        tk.Frame(row1, bg="#000000", width=40).pack(side="left")
-        self.kpi_planned.pack(side="right", padx=30)
-        self.kpi_trays_to_complete.pack(side="right", padx=30)
+        # tighter spacing so titles don’t clip
+        self.kpi_traypack.pack(side="left", padx=22)
+        self.kpi_traysmin.pack(side="left", padx=22)
+        self.kpi_avg_ossid.pack(side="left", padx=22)
+        self.kpi_avg_repak.pack(side="left", padx=22)
+        tk.Frame(row1, bg="#000000", width=10).pack(side="left")
+        self.kpi_planned.pack(side="right", padx=22)
+        self.kpi_trays_to_complete.pack(side="right", padx=22)
 
         row2 = tk.Frame(root, bg="#000000")
         row2.pack(fill="x", padx=30, pady=(0, 10))
-
         self.tray_completed = RatioBlock(row2, "RUN RATIO (TRAYS) - COMPLETED")
         self.tray_remaining = RatioBlock(row2, "RUN RATIO (TRAYS) - REMAINING")
         self.tray_completed.pack(side="left", padx=60)
@@ -1021,10 +999,9 @@ class App(tk.Tk):
 
         row3 = tk.Frame(root, bg="#000000")
         row3.pack(fill="x", padx=30, pady=(10, 10))
-
         self.kpi_tpcases = KpiBlock(row3, "TP CASES")
         self.kpi_casesmin = KpiBlock(row3, "CASES/MIN")
-        self.kpi_cases_to_complete = KpiBlock(row3, "CASES TO COMPLETE", value_color="#ff2b2b")
+        self.kpi_cases_to_complete = KpiBlock(row3, "CASES TO COM", value_color="#ff2b2b")
 
         self.kpi_tpcases.pack(side="left", padx=40)
         self.kpi_casesmin.pack(side="left", padx=40)
@@ -1032,7 +1009,6 @@ class App(tk.Tk):
 
         row4 = tk.Frame(root, bg="#000000")
         row4.pack(fill="x", padx=30, pady=(0, 10))
-
         self.case_completed = RatioBlock(row4, "CASE RATIO - COMPLETED")
         self.case_remaining = RatioBlock(row4, "CASE RATIO - REMAINING")
         self.case_completed.pack(side="left", padx=60)
@@ -1045,14 +1021,21 @@ class App(tk.Tk):
                        font=("Segoe UI", 22, "bold"))
         lbl.pack(pady=(0, 8))
 
-        self.lbl_estimates = tk.Label(root, text="Run Shortsheet + Production then Refresh Dashboard.",
-                                      bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold"),
-                                      justify="left")
-        self.lbl_estimates.pack(anchor="w", padx=60, pady=(0, 6))
+        # cleaner first line + not “off”
+        self.lbl_estimates = tk.Label(
+            root,
+            text="Run Shortsheet + Production then Refresh Dashboard.",
+            bg="#000000",
+            fg="#00ff00",
+            font=("Segoe UI", 11, "bold"),
+            justify="left",
+            anchor="w",
+        )
+        self.lbl_estimates.pack(fill="x", anchor="w", padx=60, pady=(0, 6))
 
         self.lbl_warning = tk.Label(root, text="", bg="#000000", fg="#ff2b2b",
-                                    font=("Segoe UI", 12, "bold"), justify="left")
-        self.lbl_warning.pack(anchor="w", padx=60, pady=(0, 10))
+                                    font=("Segoe UI", 12, "bold"), justify="left", anchor="w")
+        self.lbl_warning.pack(fill="x", anchor="w", padx=60, pady=(0, 20))
 
         self.refresh_dashboard()
 
@@ -1064,7 +1047,7 @@ class App(tk.Tk):
     def compute_dashboard_payload(self, fed_filter: str | None = None) -> dict:
         now = datetime.now()
 
-        # --- Run mins from manual start time ---
+        # run mins
         run_mins = 0.0
         start_dt = None
         end_dt = None
@@ -1080,7 +1063,7 @@ class App(tk.Tk):
         ossid_lines = max(1, int(self.var_ossid_lines.get() or 1))
         repak_lines = max(1, int(self.var_repak_lines.get() or 1))
 
-        # --- Production totals ---
+        # production totals
         prod_df = self.last_production_df
 
         trays_completed_total = 0.0
@@ -1090,7 +1073,7 @@ class App(tk.Tk):
         cases_completed_ossid = 0.0
         cases_completed_repak = 0.0
 
-        # Always compute ALL for rates
+        # ALL production (for rates)
         trays_completed_total_all = 0.0
         trays_completed_ossid_all = 0.0
         trays_completed_repak_all = 0.0
@@ -1117,7 +1100,7 @@ class App(tk.Tk):
             cases_completed_ossid = float(po.get("CasesProduced", 0).sum()) if not po.empty else 0.0
             cases_completed_repak = float(pr.get("CasesProduced", 0).sum()) if not pr.empty else 0.0
 
-        # Actual rates (overall + machine) based on ALL production
+        # actual rates (use ALL production)
         trays_per_min_all = (trays_completed_total_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_ossid_all = (trays_completed_ossid_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_repak_all = (trays_completed_repak_all / run_mins) if run_mins > 0 else 0.0
@@ -1128,7 +1111,7 @@ class App(tk.Tk):
         trays_per_min_display = (trays_completed_total / run_mins) if run_mins > 0 else 0.0
         cases_per_min_display = (cases_completed_total / run_mins) if run_mins > 0 else 0.0
 
-        # --- Remaining (shortsheet) ---
+        # remaining
         trays_remaining_total = 0.0
         cases_remaining_total = 0.0
         trays_remaining_ossid = 0.0
@@ -1166,10 +1149,7 @@ class App(tk.Tk):
             planned_cases = float(planned_df["RemainingCases"].sum()) if not planned_df.empty else 0.0
             planned_trays = float(planned_df["TraysRemaining"].sum()) if not planned_df.empty else 0.0
 
-            if bool(self.var_apply_planned_shorts.get()):
-                ss_calc = ss[~ss["Excluded"]].copy()
-            else:
-                ss_calc = ss.copy()
+            ss_calc = ss[~ss["Excluded"]].copy() if bool(self.var_apply_planned_shorts.get()) else ss.copy()
 
             trays_remaining_total = float(ss_calc["TraysRemaining"].sum())
             cases_remaining_total = float(ss_calc["RemainingCases"].sum())
@@ -1184,18 +1164,16 @@ class App(tk.Tk):
 
             remain_for_std = ss_calc[["Machine", "TraysRemaining", "StdTPM"]].copy()
 
-        # --- Standard minutes ---
         std = self.compute_standard_minutes(remain_for_std)
         std_ossid_min = std["ossid"]
         std_repak_min = std["repak"]
         std_total_min = std["total"]
 
-        # --- Build estimates ---
         lines = []
         warn_lines = []
 
         if fed_filter:
-            # FED POPUP: hours-needed only (not a clock finish time)
+            # category windows: hours needed only
             lines.append("Rate basis: OVERALL performance (not category-specific)")
             lines.append("")
             lines.append(f"CURRENT RATE (OSSID): {trays_per_min_ossid_all:,.2f} trays/min  |  Avg/line: {avg_tpm_line_o:,.2f}")
@@ -1214,15 +1192,15 @@ class App(tk.Tk):
             lines.append(f"REPAK remaining trays: {trays_remaining_repak:,.0f} -> {hours_needed(trays_remaining_repak, trays_per_min_repak_all)}")
             lines.append(f"TOTAL remaining trays: {trays_remaining_total:,.0f} -> {hours_needed(trays_remaining_total, trays_per_min_all)}")
             lines.append("")
-            lines.append("STANDARD (based on StdTPM + lines running):")
+            lines.append("STANDARD (StdTPM + lines running):")
             lines.append(f"OSSID standard time: {fmt_duration_minutes(std_ossid_min)}")
             lines.append(f"REPAK standard time: {fmt_duration_minutes(std_repak_min)}")
             lines.append(f"TOTAL standard time: {fmt_duration_minutes(std_total_min)}")
 
         else:
-            # MAIN PAGE: finish clock times + standard time
             end_txt = end_dt.strftime("%H:%M") if end_dt else "—"
             start_txt = start_dt.strftime("%H:%M") if start_dt else "—"
+
             lines.append(f"Start: {start_txt} | End: {end_txt} | Run mins so far: {run_mins:,.0f}")
             lines.append(
                 f"Trays/min (TOTAL): {trays_per_min_all:,.2f} | OSSID: {trays_per_min_ossid_all:,.2f} | REPAK: {trays_per_min_repak_all:,.2f}"
@@ -1247,7 +1225,6 @@ class App(tk.Tk):
             lines.append(fmt_finish("REPAK", trays_remaining_repak, trays_per_min_repak_all, std_repak_min))
             lines.append(fmt_finish("TOTAL", trays_remaining_total, trays_per_min_all, std_total_min))
 
-            # Warnings vs end time (use ACTUAL)
             if start_dt is not None and end_dt is not None:
                 if trays_remaining_ossid > 0 and trays_per_min_ossid_all > 0:
                     finish_o = now + timedelta(minutes=(trays_remaining_ossid / trays_per_min_ossid_all))
@@ -1262,7 +1239,6 @@ class App(tk.Tk):
                     if finish_t > end_dt:
                         warn_lines.append(f"⚠ TOTAL projected finish {finish_t.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
 
-        # --- Render payload ---
         def fmt_kpi(v, decimals=0):
             if v <= 0:
                 return "—"
@@ -1284,7 +1260,7 @@ class App(tk.Tk):
             "trays_rem_o": fmt_kpi(trays_remaining_ossid, 0),
             "trays_rem_r": fmt_kpi(trays_remaining_repak, 0),
             "tp_cases": fmt_kpi(cases_completed_total, 0),
-            "cases_min": fmt_kpi(cases_per_min_display, 2) if (cases_per_min_display > 0 and not fed_filter) else ("—" if fed_filter else "—"),
+            "cases_min": fmt_kpi(cases_per_min_display, 2) if cases_per_min_display > 0 else "—",
             "cases_to_complete": fmt_kpi(cases_remaining_total, 0),
             "cases_done_o": fmt_kpi(cases_completed_ossid, 0),
             "cases_done_r": fmt_kpi(cases_completed_repak, 0),
@@ -1303,8 +1279,8 @@ class App(tk.Tk):
 
         self.kpi_traypack.set_value(payload["tray_pack"])
         self.kpi_traysmin.set_value(payload["trays_min"])
-        self.kpi_avg_ossid.set_value(payload.get("avg_line_o", "—"))
-        self.kpi_avg_repak.set_value(payload.get("avg_line_r", "—"))
+        self.kpi_avg_ossid.set_value(payload["avg_line_o"])
+        self.kpi_avg_repak.set_value(payload["avg_line_r"])
         self.kpi_trays_to_complete.set_value(payload["trays_to_complete"])
         self.kpi_planned.set_value(payload["planned"])
 
@@ -1320,7 +1296,9 @@ class App(tk.Tk):
         self.lbl_estimates.configure(text=payload["estimates"])
         self.lbl_warning.configure(text=payload["warnings"])
 
-    # ---------------- Planned shorts actions ----------------
+    # -----------------------------
+    # Planned shorts actions
+    # -----------------------------
     def on_planned_search(self):
         q = (self.var_planned_search.get() or "").strip().lower()
         if not q:
@@ -1378,7 +1356,9 @@ class App(tk.Tk):
         self._set_planned_for_range(key, planned)
         self._refresh_planned_listbox()
 
-    # ---------------- Shortsheet actions ----------------
+    # -----------------------------
+    # Shortsheet run
+    # -----------------------------
     def on_run_shortsheets(self):
         if pyodbc is None:
             messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
@@ -1417,8 +1397,11 @@ class App(tk.Tk):
             if self.master_df is not None and not self.master_df.empty:
                 m = self.master_df.copy()
                 df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
-                df2 = df2.merge(m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen", "Fed"]],
-                                on="PLU", how="left")
+                df2 = df2.merge(
+                    m[["PLU", "DESC", "Trays", "TPM", "Type", "Machine", "Frozen", "Fed"]],
+                    on="PLU",
+                    how="left"
+                )
                 df2 = df2.rename(columns={"DESC": "ProductDescription", "Trays": "TraysPerCase", "TPM": "StdTPM"})
             else:
                 df2["ProductDescription"] = ""
@@ -1447,10 +1430,13 @@ class App(tk.Tk):
             df2["Excluded"] = df2["PLU"].astype(str).str.zfill(5).isin(planned_set)
 
             # Sort by Fed custom order then RemainingCases desc
-            fed_cat = pd.Categorical(df2["Fed"], categories=FED_ORDER, ordered=True)
-            df2["_FedSort"] = fed_cat
-            df2 = df2.sort_values(by=["_FedSort", "RemainingCases", "Fed", "PLU"], ascending=[True, False, True, True])
-            df2 = df2.drop(columns=["_FedSort"])
+            if "Fed" in df2.columns:
+                fed_cat = pd.Categorical(df2["Fed"], categories=FED_ORDER, ordered=True)
+                df2["_FedSort"] = fed_cat
+                df2 = df2.sort_values(by=["_FedSort", "RemainingCases", "Fed", "PLU"], ascending=[True, False, True, True])
+                df2 = df2.drop(columns=["_FedSort"])
+            else:
+                df2 = df2.sort_values(by=["RemainingCases", "PLU"], ascending=[False, True])
 
             self.last_shortsheets_detail = df2[[
                 "Fed", "Machine", "Type",
@@ -1475,7 +1461,9 @@ class App(tk.Tk):
             self._log(traceback.format_exc())
             messagebox.showerror("Shortsheet Error", str(e))
 
-    # ---------------- Production ----------------
+    # -----------------------------
+    # Production run
+    # -----------------------------
     def on_refresh_production(self):
         if pyodbc is None:
             messagebox.showerror("Missing Dependency", "pyodbc is not installed.")
@@ -1548,7 +1536,6 @@ class App(tk.Tk):
             ]].copy().sort_values(by=["Fed", "Machine", "Type", "TraysProduced"], ascending=[True, True, True, False])
 
             self.prod_table.set_dataframe(merged_display)
-
             self._log(f"Production rows (PLU): {len(merged_display):,}")
             self.refresh_dashboard()
         except Exception as e:
@@ -1556,7 +1543,9 @@ class App(tk.Tk):
             self._log(traceback.format_exc())
             messagebox.showerror("Production Error", str(e))
 
-    # ---------------- Tabs ----------------
+    # -----------------------------
+    # Tabs
+    # -----------------------------
     def _build_tab_shortsheets(self):
         pad = {"padx": 10, "pady": 6}
 
@@ -1645,7 +1634,6 @@ class App(tk.Tk):
             "CasesProduced", "LbsProduced", "TraysProduced"
         ], height=18)
         self.prod_table.pack(fill="both", expand=True, padx=10, pady=10)
-
 
 
 def main():
