@@ -21,7 +21,7 @@ CONFIG_FILE = "config.json"
 MACHINE_OSSID = "O"
 MACHINE_REPAK = "R"
 
-# If you want a custom Fed sort order, edit this list
+# Optional custom Fed sort order
 FED_ORDER = ["Organic", "ABF", "Heirloom", "Legacy", "NGMO"]
 
 
@@ -119,7 +119,7 @@ def _build_in_list_sql(values: list[str]) -> str:
 
 
 def sql_int_expr(col_name: str) -> str:
-    # works on older SQL Server (no TRY_CONVERT)
+    # Works on older SQL Server (no TRY_CONVERT)
     return f"(CASE WHEN ISNUMERIC({col_name}) = 1 THEN CAST({col_name} AS INT) ELSE NULL END)"
 
 
@@ -693,6 +693,28 @@ class App(tk.Tk):
         print(f"[{ts}] {msg}")
 
     # -----------------------------
+    # Manual refresh that re-runs SQL (push-button only)
+    # -----------------------------
+    def on_refresh_all(self):
+        """
+        Manual push refresh: re-run Shortsheet and Production (if packdate filled),
+        then refresh the dashboard.
+        """
+        try:
+            _ = self._parse_txn_from_to()
+            self.on_run_shortsheets()
+        except Exception:
+            pass
+
+        try:
+            if (self.var_packdate.get() or "").strip():
+                self.on_refresh_production()
+        except Exception:
+            pass
+
+        self.refresh_dashboard()
+
+    # -----------------------------
     # Excel export
     # -----------------------------
     def _choose_export_path(self, default_name: str) -> str:
@@ -826,7 +848,8 @@ class App(tk.Tk):
         topbar.pack(fill="x", padx=10, pady=(10, 6))
         ttk.Button(topbar, text="⚙ Settings…", command=self.open_settings).pack(side="left")
         ttk.Label(topbar, text="   ").pack(side="left")
-        ttk.Button(topbar, text="Refresh Dashboard", command=self.refresh_dashboard).pack(side="left")
+        # Manual push refresh that re-runs SQL:
+        ttk.Button(topbar, text="Refresh All", command=self.on_refresh_all).pack(side="left")
 
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=10, pady=10)
@@ -846,7 +869,7 @@ class App(tk.Tk):
     def open_settings(self):
         SettingsWindow(self, self.cfg, self._apply_settings)
 
-    def _apply_settings(self, cfg: AppConfig):
+    def _apply_settings(self, cfg):
         cfg.planned_shorts = self.cfg.planned_shorts or {}
         self.cfg = cfg
         self._log("Settings applied.")
@@ -928,7 +951,6 @@ class App(tk.Tk):
     # Dashboard
     # -----------------------------
     def _build_tab_dashboard(self):
-        # Scrollable dashboard container
         canvas = tk.Canvas(self.tab_dash, bg="#000000", highlightthickness=0)
         vscroll = ttk.Scrollbar(self.tab_dash, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vscroll.set)
@@ -1014,7 +1036,7 @@ class App(tk.Tk):
 
         self.lbl_estimates = tk.Label(
             root,
-            text="Run Shortsheet + Production then Refresh Dashboard.",
+            text="Run Shortsheet + Production then Refresh All.",
             bg="#000000",
             fg="#00ff00",
             font=("Segoe UI", 11, "bold"),
@@ -1371,7 +1393,6 @@ class App(tk.Tk):
                 self.last_shortsheets_detail = df
                 self.short_table.set_dataframe(pd.DataFrame(columns=self.short_table.columns))
                 self.refresh_dashboard()
-                messagebox.showinfo("Shortsheet", "No remaining balances found.")
                 return
 
             df2 = df.copy()
@@ -1393,6 +1414,11 @@ class App(tk.Tk):
                 df2["Machine"] = ""
                 df2["Frozen"] = ""
                 df2["Fed"] = ""
+
+            # Make shortsheet numeric columns whole numbers (NO DECIMALS)
+            for c in ["QtyOrdered", "QtyShipped", "AvailableCases", "RemainingCases"]:
+                if c in df2.columns:
+                    df2[c] = pd.to_numeric(df2[c], errors="coerce").fillna(0).round(0).astype(int)
 
             df2["TraysPerCase"] = pd.to_numeric(df2["TraysPerCase"], errors="coerce")
             df2["StdTPM"] = pd.to_numeric(df2["StdTPM"], errors="coerce")
@@ -1435,7 +1461,6 @@ class App(tk.Tk):
             self._log(f"Shortsheet rows: {len(display):,} (TxnDate range {from_d} -> {to_d})")
 
             self._refresh_planned_listbox()
-            self.refresh_dashboard()
         except Exception as e:
             self._log(f"ERROR shortsheet: {e}")
             self._log(traceback.format_exc())
@@ -1479,7 +1504,6 @@ class App(tk.Tk):
                 self.last_production_df = pd.DataFrame()
                 self.prod_table.set_dataframe(pd.DataFrame(columns=self.prod_table.columns))
                 self.refresh_dashboard()
-                messagebox.showinfo("Production", "No production found for that packdate/status set.")
                 return
 
             m = self.master_df.copy()
