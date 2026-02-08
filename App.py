@@ -76,7 +76,6 @@ def list_odbc_drivers() -> list[str]:
                 preferred.append(d)
             else:
                 other.append(d)
-        # newest-ish first for preferred
         return preferred[::-1] + other
     except Exception:
         return []
@@ -162,7 +161,6 @@ def load_product_master(path: str) -> pd.DataFrame:
 
     df["PLU"] = df["PLU"].astype(str).str.strip().str.zfill(5)
 
-    # normalize common columns you’ve been using
     df["DESC"] = df["DESC"].astype(str).fillna("") if "DESC" in df.columns else ""
     df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float) if "Trays" in df.columns else 0.0
     df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float) if "TPM" in df.columns else 0.0
@@ -577,13 +575,13 @@ class CategoryDashboard(tk.Toplevel):
         row1.pack(fill="x", padx=30, pady=(25, 10))
 
         self.kpi_traypack = KpiBlock(row1, "TRAY PACK")
-        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COM", value_color="#ff2b2b")
+        self.kpi_trs_needed = KpiBlock(row1, "TRS NEEDED", value_color="#ff2b2b")
         self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
         self.kpi_traypack.pack(side="left", padx=30)
         tk.Frame(row1, bg="#000000", width=50).pack(side="left")
         self.kpi_planned.pack(side="right", padx=30)
-        self.kpi_trays_to_complete.pack(side="right", padx=30)
+        self.kpi_trs_needed.pack(side="right", padx=30)
 
         row2 = tk.Frame(self, bg="#000000")
         row2.pack(fill="x", padx=30, pady=(0, 10))
@@ -596,9 +594,9 @@ class CategoryDashboard(tk.Toplevel):
         row3.pack(fill="x", padx=30, pady=(10, 10))
 
         self.kpi_tpcases = KpiBlock(row3, "TP CASES")
-        self.kpi_cases_to_complete = KpiBlock(row3, "CASES TO COM", value_color="#ff2b2b")
+        self.kpi_cs_needed = KpiBlock(row3, "CS NEEDED", value_color="#ff2b2b")
         self.kpi_tpcases.pack(side="left", padx=40)
-        self.kpi_cases_to_complete.pack(side="right", padx=40)
+        self.kpi_cs_needed.pack(side="right", padx=40)
 
         row4 = tk.Frame(self, bg="#000000")
         row4.pack(fill="x", padx=30, pady=(0, 10))
@@ -630,7 +628,7 @@ class CategoryDashboard(tk.Toplevel):
             return
 
         self.kpi_traypack.set_value(data["tray_pack"])
-        self.kpi_trays_to_complete.set_value(data["trays_to_complete"])
+        self.kpi_trs_needed.set_value(data["trs_needed"])
         self.kpi_planned.set_value(data["planned"])
 
         self.tray_completed.set_values(data["trays_done_o"], data["trays_done_r"])
@@ -639,7 +637,7 @@ class CategoryDashboard(tk.Toplevel):
         self.case_remaining.set_values(data["cases_rem_o"], data["cases_rem_r"])
 
         self.kpi_tpcases.set_value(data["tp_cases"])
-        self.kpi_cases_to_complete.set_value(data["cases_to_complete"])
+        self.kpi_cs_needed.set_value(data["cs_needed"])
 
         self.lbl_estimates.configure(text=data["estimates"])
 
@@ -686,6 +684,13 @@ class App(tk.Tk):
         self._log("Ready.")
         self._load_master(initial=True)
         self._refresh_planned_listbox()
+
+    # -----------------------------
+    # Logging (no log window)
+    # -----------------------------
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] {msg}")
 
     # -----------------------------
     # Excel export
@@ -838,17 +843,6 @@ class App(tk.Tk):
         self._build_tab_shortsheets()
         self._build_tab_production()
 
-        frm_log = ttk.LabelFrame(self, text="Log")
-        frm_log.pack(fill="both", expand=False, padx=10, pady=(0, 10))
-        self.txt_log = tk.Text(frm_log, height=8, wrap="word")
-        self.txt_log.pack(fill="both", expand=True, padx=10, pady=10)
-
-    def _log(self, msg: str):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.txt_log.insert("end", f"[{ts}] {msg}\n")
-        self.txt_log.see("end")
-        self.update_idletasks()
-
     def open_settings(self):
         SettingsWindow(self, self.cfg, self._apply_settings)
 
@@ -934,11 +928,10 @@ class App(tk.Tk):
     # Dashboard
     # -----------------------------
     def _build_tab_dashboard(self):
-        # Make dashboard scrollable (fixes bottom cutoff)
+        # Scrollable dashboard container
         canvas = tk.Canvas(self.tab_dash, bg="#000000", highlightthickness=0)
         vscroll = ttk.Scrollbar(self.tab_dash, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vscroll.set)
-
         vscroll.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
@@ -977,18 +970,16 @@ class App(tk.Tk):
         self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")
         self.kpi_avg_ossid = KpiBlock(row1, "AVG TPM/LINE (O)")
         self.kpi_avg_repak = KpiBlock(row1, "AVG TPM/LINE (R)")
-        # shortened titles (fix cut-off)
-        self.kpi_trays_to_complete = KpiBlock(row1, "TRAYS TO COM", value_color="#ff2b2b")
+        self.kpi_trs_needed = KpiBlock(row1, "TRS NEEDED", value_color="#ff2b2b")
         self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
-        # tighter spacing so titles don’t clip
         self.kpi_traypack.pack(side="left", padx=22)
         self.kpi_traysmin.pack(side="left", padx=22)
         self.kpi_avg_ossid.pack(side="left", padx=22)
         self.kpi_avg_repak.pack(side="left", padx=22)
         tk.Frame(row1, bg="#000000", width=10).pack(side="left")
         self.kpi_planned.pack(side="right", padx=22)
-        self.kpi_trays_to_complete.pack(side="right", padx=22)
+        self.kpi_trs_needed.pack(side="right", padx=22)
 
         row2 = tk.Frame(root, bg="#000000")
         row2.pack(fill="x", padx=30, pady=(0, 10))
@@ -1001,11 +992,11 @@ class App(tk.Tk):
         row3.pack(fill="x", padx=30, pady=(10, 10))
         self.kpi_tpcases = KpiBlock(row3, "TP CASES")
         self.kpi_casesmin = KpiBlock(row3, "CASES/MIN")
-        self.kpi_cases_to_complete = KpiBlock(row3, "CASES TO COM", value_color="#ff2b2b")
+        self.kpi_cs_needed = KpiBlock(row3, "CS NEEDED", value_color="#ff2b2b")
 
         self.kpi_tpcases.pack(side="left", padx=40)
         self.kpi_casesmin.pack(side="left", padx=40)
-        self.kpi_cases_to_complete.pack(side="right", padx=40)
+        self.kpi_cs_needed.pack(side="right", padx=40)
 
         row4 = tk.Frame(root, bg="#000000")
         row4.pack(fill="x", padx=30, pady=(0, 10))
@@ -1021,7 +1012,6 @@ class App(tk.Tk):
                        font=("Segoe UI", 22, "bold"))
         lbl.pack(pady=(0, 8))
 
-        # cleaner first line + not “off”
         self.lbl_estimates = tk.Label(
             root,
             text="Run Shortsheet + Production then Refresh Dashboard.",
@@ -1047,7 +1037,6 @@ class App(tk.Tk):
     def compute_dashboard_payload(self, fed_filter: str | None = None) -> dict:
         now = datetime.now()
 
-        # run mins
         run_mins = 0.0
         start_dt = None
         end_dt = None
@@ -1063,7 +1052,6 @@ class App(tk.Tk):
         ossid_lines = max(1, int(self.var_ossid_lines.get() or 1))
         repak_lines = max(1, int(self.var_repak_lines.get() or 1))
 
-        # production totals
         prod_df = self.last_production_df
 
         trays_completed_total = 0.0
@@ -1073,7 +1061,6 @@ class App(tk.Tk):
         cases_completed_ossid = 0.0
         cases_completed_repak = 0.0
 
-        # ALL production (for rates)
         trays_completed_total_all = 0.0
         trays_completed_ossid_all = 0.0
         trays_completed_repak_all = 0.0
@@ -1100,7 +1087,6 @@ class App(tk.Tk):
             cases_completed_ossid = float(po.get("CasesProduced", 0).sum()) if not po.empty else 0.0
             cases_completed_repak = float(pr.get("CasesProduced", 0).sum()) if not pr.empty else 0.0
 
-        # actual rates (use ALL production)
         trays_per_min_all = (trays_completed_total_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_ossid_all = (trays_completed_ossid_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_repak_all = (trays_completed_repak_all / run_mins) if run_mins > 0 else 0.0
@@ -1111,7 +1097,6 @@ class App(tk.Tk):
         trays_per_min_display = (trays_completed_total / run_mins) if run_mins > 0 else 0.0
         cases_per_min_display = (cases_completed_total / run_mins) if run_mins > 0 else 0.0
 
-        # remaining
         trays_remaining_total = 0.0
         cases_remaining_total = 0.0
         trays_remaining_ossid = 0.0
@@ -1173,7 +1158,6 @@ class App(tk.Tk):
         warn_lines = []
 
         if fed_filter:
-            # category windows: hours needed only
             lines.append("Rate basis: OVERALL performance (not category-specific)")
             lines.append("")
             lines.append(f"CURRENT RATE (OSSID): {trays_per_min_ossid_all:,.2f} trays/min  |  Avg/line: {avg_tpm_line_o:,.2f}")
@@ -1196,7 +1180,6 @@ class App(tk.Tk):
             lines.append(f"OSSID standard time: {fmt_duration_minutes(std_ossid_min)}")
             lines.append(f"REPAK standard time: {fmt_duration_minutes(std_repak_min)}")
             lines.append(f"TOTAL standard time: {fmt_duration_minutes(std_total_min)}")
-
         else:
             end_txt = end_dt.strftime("%H:%M") if end_dt else "—"
             start_txt = start_dt.strftime("%H:%M") if start_dt else "—"
@@ -1253,7 +1236,7 @@ class App(tk.Tk):
             "trays_min": fmt_kpi(trays_per_min_all, 2) if trays_per_min_all > 0 else "—",
             "avg_line_o": fmt_kpi(avg_tpm_line_o, 2) if avg_tpm_line_o > 0 else "—",
             "avg_line_r": fmt_kpi(avg_tpm_line_r, 2) if avg_tpm_line_r > 0 else "—",
-            "trays_to_complete": fmt_kpi(trays_remaining_total, 0),
+            "trs_needed": fmt_kpi(trays_remaining_total, 0),
             "planned": planned_txt,
             "trays_done_o": fmt_kpi(trays_completed_ossid, 0),
             "trays_done_r": fmt_kpi(trays_completed_repak, 0),
@@ -1261,7 +1244,7 @@ class App(tk.Tk):
             "trays_rem_r": fmt_kpi(trays_remaining_repak, 0),
             "tp_cases": fmt_kpi(cases_completed_total, 0),
             "cases_min": fmt_kpi(cases_per_min_display, 2) if cases_per_min_display > 0 else "—",
-            "cases_to_complete": fmt_kpi(cases_remaining_total, 0),
+            "cs_needed": fmt_kpi(cases_remaining_total, 0),
             "cases_done_o": fmt_kpi(cases_completed_ossid, 0),
             "cases_done_r": fmt_kpi(cases_completed_repak, 0),
             "cases_rem_o": fmt_kpi(cases_remaining_ossid, 0),
@@ -1281,7 +1264,7 @@ class App(tk.Tk):
         self.kpi_traysmin.set_value(payload["trays_min"])
         self.kpi_avg_ossid.set_value(payload["avg_line_o"])
         self.kpi_avg_repak.set_value(payload["avg_line_r"])
-        self.kpi_trays_to_complete.set_value(payload["trays_to_complete"])
+        self.kpi_trs_needed.set_value(payload["trs_needed"])
         self.kpi_planned.set_value(payload["planned"])
 
         self.tray_completed.set_values(payload["trays_done_o"], payload["trays_done_r"])
@@ -1291,7 +1274,7 @@ class App(tk.Tk):
 
         self.kpi_tpcases.set_value(payload["tp_cases"])
         self.kpi_casesmin.set_value(payload["cases_min"])
-        self.kpi_cases_to_complete.set_value(payload["cases_to_complete"])
+        self.kpi_cs_needed.set_value(payload["cs_needed"])
 
         self.lbl_estimates.configure(text=payload["estimates"])
         self.lbl_warning.configure(text=payload["warnings"])
@@ -1393,7 +1376,6 @@ class App(tk.Tk):
 
             df2 = df.copy()
 
-            # Join master
             if self.master_df is not None and not self.master_df.empty:
                 m = self.master_df.copy()
                 df2["PLU"] = df2["PLU"].astype(str).str.zfill(5)
@@ -1424,12 +1406,10 @@ class App(tk.Tk):
             if exclude_frozen:
                 df2 = df2[df2["Frozen"] != "Y"].copy()
 
-            # Planned shorts flag (by RANGE)
             key = self._range_key()
             planned_set = self._get_planned_set_for_range(key)
             df2["Excluded"] = df2["PLU"].astype(str).str.zfill(5).isin(planned_set)
 
-            # Sort by Fed custom order then RemainingCases desc
             if "Fed" in df2.columns:
                 fed_cat = pd.Categorical(df2["Fed"], categories=FED_ORDER, ordered=True)
                 df2["_FedSort"] = fed_cat
