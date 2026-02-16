@@ -40,7 +40,11 @@ class AppConfig:
     output_folder: str = ""
     exclude_missing_master: bool = True
     exclude_frozen_y: bool = False
-    planned_shorts: dict = field(default_factory=dict)  # rangeKey -> [PLU,...]
+    # planned_shorts: rangeKey -> [PLU,...]
+    planned_shorts: dict = field(default_factory=dict)
+    # IMPORTANT: if True, ScanningSalesOrder/WaitingToBeInvoiced will only count
+    # if Wip.SO is a SalesOrder TxnID that exists in the TxnDate range.
+    strict_scanning_waiting_by_so: bool = True
 
 
 def load_config() -> AppConfig:
@@ -51,6 +55,8 @@ def load_config() -> AppConfig:
             merged = {**AppConfig().__dict__, **data}
             if not isinstance(merged.get("planned_shorts"), dict):
                 merged["planned_shorts"] = {}
+            if "strict_scanning_waiting_by_so" not in merged:
+                merged["strict_scanning_waiting_by_so"] = True
             return AppConfig(**merged)
         except Exception:
             return AppConfig()
@@ -184,7 +190,25 @@ def product_machines(master_df: pd.DataFrame) -> list[str]:
 # -----------------------------
 # SQL queries
 # -----------------------------
-def fetch_shortsheets_range(conn, from_date: date, to_date: date, wip_statuses: list[str], only_remaining: bool) -> pd.DataFrame:
+def fetch_shortsheets_range(
+    conn,
+    from_date: date,
+    to_date: date,
+    wip_statuses: list[str],
+    only_remaining: bool,
+    strict_scanning_waiting_by_so: bool,
+) -> pd.DataFrame:
+    """
+    Shortsheet query:
+      - OrdersForRange = TxnIDs in GP_SalesOrder within TxnDate range.
+      - OrderedAgg = sum of Quantity from GP_SalesOrderLineDetail for those TxnIDs.
+      - ShippedAgg = sum of QtyShipped from Shipped for those TxnIDs (OrderNum).
+      - InvAgg = count Wip cases:
+            * status='Available' is counted normally (by PLU, tied to OrderedAgg).
+            * status IN ('ScanningSalesOrder','WaitingToBeInvoiced') is ONLY counted if
+              Wip.SO matches a TxnID in OrdersForRange (prevents old "stuck" cases from last year).
+        If strict_scanning_waiting_by_so is False, all selected Wip statuses are counted as before.
+    """
     if not wip_statuses:
         wip_statuses = ["Available"]
     if to_date < from_date:
@@ -201,6 +225,26 @@ def fetch_shortsheets_range(conn, from_date: date, to_date: date, wip_statuses: 
 
     remaining_expr = "(oa.QtyOrdered - ISNULL(sa.QtyShipped,0) - ISNULL(ia.AvailableCases,0))"
     where_remaining = f"WHERE {remaining_expr} > 0" if only_remaining else ""
+
+    # InvAgg condition:
+    # - ALWAYS count Available if selected.
+    # - If strict mode: Scanning/Waiting count only if w.SO is in OrdersForRange.
+    # - If not strict: count anything in status_sql.
+    if strict_scanning_waiting_by_so:
+        inv_where = f"""
+        (
+            w.status = 'Available'
+            AND w.status IN ({status_sql})
+        )
+        OR
+        (
+            w.status IN ('ScanningSalesOrder','WaitingToBeInvoiced')
+            AND w.status IN ({status_sql})
+            AND o.TxnID IS NOT NULL
+        )
+        """
+    else:
+        inv_where = f"w.status IN ({status_sql})"
 
     sql = f"""
     WITH OrdersForRange AS (
@@ -233,7 +277,9 @@ def fetch_shortsheets_range(conn, from_date: date, to_date: date, wip_statuses: 
             COUNT(*) AS AvailableCases
         FROM WPL.dbo.Wip w
         JOIN OrderedAgg oa ON oa.PLU_Int = {w_plu}
-        WHERE w.status IN ({status_sql})
+        LEFT JOIN OrdersForRange o ON o.TxnID = LTRIM(RTRIM(w.SO))
+        WHERE
+            {inv_where}
           AND {w_plu} IS NOT NULL
         GROUP BY {w_plu}
     )
@@ -342,6 +388,7 @@ class TableView(ttk.Frame):
             self.tree.heading(c, text=c)
             self.tree.column(c, width=140, anchor="w")
 
+        # mousewheel scroll
         self.tree.bind("<Enter>", lambda e: self.tree.bind_all("<MouseWheel>", self._on_mousewheel))
         self.tree.bind("<Leave>", lambda e: self.tree.unbind_all("<MouseWheel>"))
 
@@ -443,6 +490,8 @@ class SettingsWindow(tk.Toplevel):
         self.var_exclude_missing = tk.BooleanVar(value=cfg.exclude_missing_master)
         self.var_exclude_frozen = tk.BooleanVar(value=cfg.exclude_frozen_y)
 
+        self.var_strict_sw = tk.BooleanVar(value=cfg.strict_scanning_waiting_by_so)
+
         pad = {"padx": 10, "pady": 6}
 
         frm = ttk.Frame(self)
@@ -496,6 +545,13 @@ class SettingsWindow(tk.Toplevel):
         )
 
         r += 1
+        ttk.Checkbutton(
+            frm,
+            text="Strict mode: only count Scanning/Waiting WIP if Wip.SO is in TxnDate range",
+            variable=self.var_strict_sw
+        ).grid(row=r, column=0, columnspan=4, sticky="w", **pad)
+
+        r += 1
         btns = ttk.Frame(frm)
         btns.grid(row=r, column=0, columnspan=4, sticky="e", padx=10, pady=(10, 0))
         ttk.Button(btns, text="Test Connection", command=self._test_connection).pack(side="left", padx=8)
@@ -536,6 +592,7 @@ class SettingsWindow(tk.Toplevel):
             exclude_missing_master=bool(self.var_exclude_missing.get()),
             exclude_frozen_y=bool(self.var_exclude_frozen.get()),
             planned_shorts={},  # replaced on apply
+            strict_scanning_waiting_by_so=bool(self.var_strict_sw.get()),
         )
 
     def _test_connection(self):
@@ -848,7 +905,6 @@ class App(tk.Tk):
         topbar.pack(fill="x", padx=10, pady=(10, 6))
         ttk.Button(topbar, text="⚙ Settings…", command=self.open_settings).pack(side="left")
         ttk.Label(topbar, text="   ").pack(side="left")
-        # Manual push refresh that re-runs SQL:
         ttk.Button(topbar, text="Refresh All", command=self.on_refresh_all).pack(side="left")
 
         self.nb = ttk.Notebook(self)
@@ -1385,7 +1441,14 @@ class App(tk.Tk):
         try:
             self._log("Connecting to SQL Server (shortsheet)...")
             with pyodbc.connect(build_connection_string(self.cfg), timeout=25) as conn:
-                df = fetch_shortsheets_range(conn, from_d, to_d, statuses, only_remaining)
+                df = fetch_shortsheets_range(
+                    conn,
+                    from_d,
+                    to_d,
+                    statuses,
+                    only_remaining,
+                    strict_scanning_waiting_by_so=bool(self.cfg.strict_scanning_waiting_by_so),
+                )
 
             if df.empty:
                 self._log("Shortsheet returned 0 rows.")
