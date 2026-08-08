@@ -20,6 +20,7 @@ CONFIG_FILE = "config.json"
 
 MACHINE_OSSID = "O"
 MACHINE_REPAK = "R"
+MACHINE_VSP = "V"  # VSP
 
 # Optional custom Fed sort order
 FED_ORDER = ["Organic", "ABF", "Heirloom", "Legacy", "NGMO"]
@@ -171,7 +172,7 @@ def load_product_master(path: str) -> pd.DataFrame:
     df["Trays"] = pd.to_numeric(df["Trays"], errors="coerce").fillna(0).astype(float) if "Trays" in df.columns else 0.0
     df["TPM"] = pd.to_numeric(df["TPM"], errors="coerce").fillna(0).astype(float) if "TPM" in df.columns else 0.0
 
-    df["Machine"] = df["Machine"].astype(str).str.strip() if "Machine" in df.columns else ""
+    df["Machine"] = df["Machine"].fillna("").astype(str).str.strip().str.upper() if "Machine" in df.columns else ""
     df["Type"] = df["Type"].astype(str).str.strip() if "Type" in df.columns else ""
     df["Frozen"] = df["Frozen"].astype(str).str.strip().str.upper() if "Frozen" in df.columns else ""
     df["Fed"] = df["Fed"].astype(str).str.strip() if "Fed" in df.columns else ""
@@ -182,9 +183,12 @@ def load_product_master(path: str) -> pd.DataFrame:
 
 def product_machines(master_df: pd.DataFrame) -> list[str]:
     if master_df.empty or "Machine" not in master_df.columns:
-        return ["All"]
-    machines = sorted({str(x).strip() for x in master_df["Machine"].dropna().unique() if str(x).strip()})
-    return ["All"] + machines
+        return ["All", MACHINE_OSSID, MACHINE_REPAK, MACHINE_VSP]
+
+    observed = {str(x).strip().upper() for x in master_df["Machine"].dropna().unique() if str(x).strip()}
+    preferred = [MACHINE_OSSID, MACHINE_REPAK, MACHINE_VSP]
+    extras = sorted(observed.difference(preferred))
+    return ["All"] + preferred + extras
 
 
 # -----------------------------
@@ -447,24 +451,30 @@ class KpiBlock(tk.Frame):
 
 
 class RatioBlock(tk.Frame):
-    def __init__(self, parent, title: str):
+    def __init__(self, parent, title: str, labels=("OSSID", "REPAK", "VSP")):
         super().__init__(parent, bg="#000000")
         tk.Label(self, text=title, bg="#000000", fg="#00ff00", font=("Segoe UI", 16, "bold")).pack(pady=(0, 6))
+
+        self.labels = list(labels)
+        self.value_widgets = []
 
         grid = tk.Frame(self, bg="#000000")
         grid.pack()
 
-        tk.Label(grid, text="OSSID", bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, padx=18)
-        tk.Label(grid, text="REPAK", bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).grid(row=0, column=1, padx=18)
+        for idx, label in enumerate(self.labels):
+            tk.Label(grid, text=label, bg="#000000", fg="#00ff00", font=("Segoe UI", 12, "bold")).grid(row=0, column=idx, padx=18)
+            value_widget = tk.Label(grid, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 16, "bold"))
+            value_widget.grid(row=1, column=idx, padx=18)
+            self.value_widgets.append(value_widget)
 
-        self.ossid = tk.Label(grid, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 16, "bold"))
-        self.repak = tk.Label(grid, text="—", bg="#000000", fg="#00ff00", font=("Segoe UI", 16, "bold"))
-        self.ossid.grid(row=1, column=0, padx=18)
-        self.repak.grid(row=1, column=1, padx=18)
-
-    def set_values(self, ossid_val: str, repak_val: str):
-        self.ossid.configure(text=ossid_val)
-        self.repak.configure(text=repak_val)
+    def set_values(self, *values):
+        if len(values) == 1 and isinstance(values[0], (list, tuple)):
+            values = tuple(values[0])
+        values = list(values)
+        while len(values) < len(self.value_widgets):
+            values.append("—")
+        for widget, value in zip(self.value_widgets, values):
+            widget.configure(text=value)
 
 
 class SettingsWindow(tk.Toplevel):
@@ -688,10 +698,10 @@ class CategoryDashboard(tk.Toplevel):
         self.kpi_trs_needed.set_value(data["trs_needed"])
         self.kpi_planned.set_value(data["planned"])
 
-        self.tray_completed.set_values(data["trays_done_o"], data["trays_done_r"])
-        self.tray_remaining.set_values(data["trays_rem_o"], data["trays_rem_r"])
-        self.case_completed.set_values(data["cases_done_o"], data["cases_done_r"])
-        self.case_remaining.set_values(data["cases_rem_o"], data["cases_rem_r"])
+        self.tray_completed.set_values(data["trays_done_o"], data["trays_done_r"], data["trays_done_v"])
+        self.tray_remaining.set_values(data["trays_rem_o"], data["trays_rem_r"], data["trays_rem_v"])
+        self.case_completed.set_values(data["cases_done_o"], data["cases_done_r"], data["cases_done_v"])
+        self.case_remaining.set_values(data["cases_rem_o"], data["cases_rem_r"], data["cases_rem_v"])
 
         self.kpi_tpcases.set_value(data["tp_cases"])
         self.kpi_cs_needed.set_value(data["cs_needed"])
@@ -706,7 +716,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1600x940")
+        self.geometry("1720x940")
 
         self.cfg = load_config()
 
@@ -734,6 +744,7 @@ class App(tk.Tk):
 
         self.var_ossid_lines = tk.IntVar(value=6)
         self.var_repak_lines = tk.IntVar(value=1)
+        self.var_vsp_lines = tk.IntVar(value=1)
 
         self.production_statuses = ["Available", "ScanningSalesOrder", "WaitingToBeInvoiced", "Shipped"]
 
@@ -976,12 +987,13 @@ class App(tk.Tk):
     def compute_standard_minutes(self, remain_df: pd.DataFrame) -> dict:
         ossid_lines = max(1, int(self.var_ossid_lines.get() or 1))
         repak_lines = max(1, int(self.var_repak_lines.get() or 1))
+        vsp_lines = max(1, int(self.var_vsp_lines.get() or 1))
 
         if remain_df is None or remain_df.empty:
-            return {"ossid": 0.0, "repak": 0.0, "total": 0.0}
+            return {"ossid": 0.0, "repak": 0.0, "vsp": 0.0, "total": 0.0}
 
         d = remain_df.copy()
-        d["Machine"] = d.get("Machine", "").fillna("Unknown").astype(str).str.strip()
+        d["Machine"] = d.get("Machine", "").fillna("Unknown").astype(str).str.strip().str.upper()
         d["TraysRemaining"] = pd.to_numeric(d.get("TraysRemaining", 0), errors="coerce").fillna(0).astype(float)
         d["StdTPM"] = pd.to_numeric(d.get("StdTPM", 0), errors="coerce").fillna(0).astype(float)
 
@@ -994,14 +1006,17 @@ class App(tk.Tk):
                 return (trays / tpm) / ossid_lines
             if row["Machine"] == MACHINE_REPAK:
                 return (trays / tpm) / repak_lines
+            if row["Machine"] == MACHINE_VSP:
+                return (trays / tpm) / vsp_lines
             return trays / tpm
 
         d["StdMinutes"] = d.apply(std_minutes_row, axis=1)
 
         ossid = float(d.loc[d["Machine"] == MACHINE_OSSID, "StdMinutes"].sum())
         repak = float(d.loc[d["Machine"] == MACHINE_REPAK, "StdMinutes"].sum())
+        vsp = float(d.loc[d["Machine"] == MACHINE_VSP, "StdMinutes"].sum())
         total = float(d["StdMinutes"].sum())
-        return {"ossid": ossid, "repak": repak, "total": total}
+        return {"ossid": ossid, "repak": repak, "vsp": vsp, "total": total}
 
     # -----------------------------
     # Dashboard
@@ -1048,16 +1063,18 @@ class App(tk.Tk):
         self.kpi_traysmin = KpiBlock(row1, "TRAYS/MIN")
         self.kpi_avg_ossid = KpiBlock(row1, "AVG TPM/LINE (O)")
         self.kpi_avg_repak = KpiBlock(row1, "AVG TPM/LINE (R)")
+        self.kpi_avg_vsp = KpiBlock(row1, "AVG TPM/LINE (V)")
         self.kpi_trs_needed = KpiBlock(row1, "TRS NEEDED", value_color="#ff2b2b")
         self.kpi_planned = KpiBlock(row1, "PLANNED SHORTS", value_color="#ff2b2b")
 
-        self.kpi_traypack.pack(side="left", padx=22)
-        self.kpi_traysmin.pack(side="left", padx=22)
-        self.kpi_avg_ossid.pack(side="left", padx=22)
-        self.kpi_avg_repak.pack(side="left", padx=22)
+        self.kpi_traypack.pack(side="left", padx=18)
+        self.kpi_traysmin.pack(side="left", padx=18)
+        self.kpi_avg_ossid.pack(side="left", padx=18)
+        self.kpi_avg_repak.pack(side="left", padx=18)
+        self.kpi_avg_vsp.pack(side="left", padx=18)
         tk.Frame(row1, bg="#000000", width=10).pack(side="left")
-        self.kpi_planned.pack(side="right", padx=22)
-        self.kpi_trs_needed.pack(side="right", padx=22)
+        self.kpi_planned.pack(side="right", padx=18)
+        self.kpi_trs_needed.pack(side="right", padx=18)
 
         row2 = tk.Frame(root, bg="#000000")
         row2.pack(fill="x", padx=30, pady=(0, 10))
@@ -1129,6 +1146,7 @@ class App(tk.Tk):
 
         ossid_lines = max(1, int(self.var_ossid_lines.get() or 1))
         repak_lines = max(1, int(self.var_repak_lines.get() or 1))
+        vsp_lines = max(1, int(self.var_vsp_lines.get() or 1))
 
         prod_df = self.last_production_df
 
@@ -1136,20 +1154,25 @@ class App(tk.Tk):
         cases_completed_total = 0.0
         trays_completed_ossid = 0.0
         trays_completed_repak = 0.0
+        trays_completed_vsp = 0.0
         cases_completed_ossid = 0.0
         cases_completed_repak = 0.0
+        cases_completed_vsp = 0.0
 
         trays_completed_total_all = 0.0
         trays_completed_ossid_all = 0.0
         trays_completed_repak_all = 0.0
+        trays_completed_vsp_all = 0.0
 
         if prod_df is not None and not prod_df.empty:
             p_all = prod_df.copy()
             trays_completed_total_all = float(p_all.get("TraysProduced", 0).sum())
-            po_all = p_all[p_all.get("Machine", "").astype(str).str.strip() == MACHINE_OSSID]
-            pr_all = p_all[p_all.get("Machine", "").astype(str).str.strip() == MACHINE_REPAK]
+            po_all = p_all[p_all.get("Machine", "").astype(str).str.strip().str.upper() == MACHINE_OSSID]
+            pr_all = p_all[p_all.get("Machine", "").astype(str).str.strip().str.upper() == MACHINE_REPAK]
+            pv_all = p_all[p_all.get("Machine", "").astype(str).str.strip().str.upper() == MACHINE_VSP]
             trays_completed_ossid_all = float(po_all.get("TraysProduced", 0).sum()) if not po_all.empty else 0.0
             trays_completed_repak_all = float(pr_all.get("TraysProduced", 0).sum()) if not pr_all.empty else 0.0
+            trays_completed_vsp_all = float(pv_all.get("TraysProduced", 0).sum()) if not pv_all.empty else 0.0
 
             p = p_all
             if fed_filter:
@@ -1158,19 +1181,24 @@ class App(tk.Tk):
             trays_completed_total = float(p.get("TraysProduced", 0).sum())
             cases_completed_total = float(p.get("CasesProduced", 0).sum())
 
-            po = p[p.get("Machine", "").astype(str).str.strip() == MACHINE_OSSID]
-            pr = p[p.get("Machine", "").astype(str).str.strip() == MACHINE_REPAK]
+            po = p[p.get("Machine", "").astype(str).str.strip().str.upper() == MACHINE_OSSID]
+            pr = p[p.get("Machine", "").astype(str).str.strip().str.upper() == MACHINE_REPAK]
+            pv = p[p.get("Machine", "").astype(str).str.strip().str.upper() == MACHINE_VSP]
             trays_completed_ossid = float(po.get("TraysProduced", 0).sum()) if not po.empty else 0.0
             trays_completed_repak = float(pr.get("TraysProduced", 0).sum()) if not pr.empty else 0.0
+            trays_completed_vsp = float(pv.get("TraysProduced", 0).sum()) if not pv.empty else 0.0
             cases_completed_ossid = float(po.get("CasesProduced", 0).sum()) if not po.empty else 0.0
             cases_completed_repak = float(pr.get("CasesProduced", 0).sum()) if not pr.empty else 0.0
+            cases_completed_vsp = float(pv.get("CasesProduced", 0).sum()) if not pv.empty else 0.0
 
         trays_per_min_all = (trays_completed_total_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_ossid_all = (trays_completed_ossid_all / run_mins) if run_mins > 0 else 0.0
         trays_per_min_repak_all = (trays_completed_repak_all / run_mins) if run_mins > 0 else 0.0
+        trays_per_min_vsp_all = (trays_completed_vsp_all / run_mins) if run_mins > 0 else 0.0
 
         avg_tpm_line_o = (trays_per_min_ossid_all / ossid_lines) if trays_per_min_ossid_all > 0 else 0.0
         avg_tpm_line_r = (trays_per_min_repak_all / repak_lines) if trays_per_min_repak_all > 0 else 0.0
+        avg_tpm_line_v = (trays_per_min_vsp_all / vsp_lines) if trays_per_min_vsp_all > 0 else 0.0
 
         trays_per_min_display = (trays_completed_total / run_mins) if run_mins > 0 else 0.0
         cases_per_min_display = (cases_completed_total / run_mins) if run_mins > 0 else 0.0
@@ -1179,8 +1207,10 @@ class App(tk.Tk):
         cases_remaining_total = 0.0
         trays_remaining_ossid = 0.0
         trays_remaining_repak = 0.0
+        trays_remaining_vsp = 0.0
         cases_remaining_ossid = 0.0
         cases_remaining_repak = 0.0
+        cases_remaining_vsp = 0.0
 
         planned_cases = 0.0
         planned_trays = 0.0
@@ -1200,7 +1230,7 @@ class App(tk.Tk):
 
             if "Machine" not in ss.columns:
                 ss["Machine"] = "Unknown"
-            ss["Machine"] = ss["Machine"].fillna("Unknown").astype(str).str.strip()
+            ss["Machine"] = ss["Machine"].fillna("Unknown").astype(str).str.strip().str.upper()
 
             if "Excluded" not in ss.columns:
                 ss["Excluded"] = False
@@ -1219,17 +1249,21 @@ class App(tk.Tk):
 
             so = ss_calc[ss_calc["Machine"] == MACHINE_OSSID]
             sr = ss_calc[ss_calc["Machine"] == MACHINE_REPAK]
+            sv = ss_calc[ss_calc["Machine"] == MACHINE_VSP]
 
             trays_remaining_ossid = float(so["TraysRemaining"].sum()) if not so.empty else 0.0
             trays_remaining_repak = float(sr["TraysRemaining"].sum()) if not sr.empty else 0.0
+            trays_remaining_vsp = float(sv["TraysRemaining"].sum()) if not sv.empty else 0.0
             cases_remaining_ossid = float(so["RemainingCases"].sum()) if not so.empty else 0.0
             cases_remaining_repak = float(sr["RemainingCases"].sum()) if not sr.empty else 0.0
+            cases_remaining_vsp = float(sv["RemainingCases"].sum()) if not sv.empty else 0.0
 
             remain_for_std = ss_calc[["Machine", "TraysRemaining", "StdTPM"]].copy()
 
         std = self.compute_standard_minutes(remain_for_std)
         std_ossid_min = std["ossid"]
         std_repak_min = std["repak"]
+        std_vsp_min = std["vsp"]
         std_total_min = std["total"]
 
         lines = []
@@ -1240,6 +1274,7 @@ class App(tk.Tk):
             lines.append("")
             lines.append(f"CURRENT RATE (OSSID): {trays_per_min_ossid_all:,.2f} trays/min  |  Avg/line: {avg_tpm_line_o:,.2f}")
             lines.append(f"CURRENT RATE (REPAK): {trays_per_min_repak_all:,.2f} trays/min  |  Avg/line: {avg_tpm_line_r:,.2f}")
+            lines.append(f"CURRENT RATE (VSP): {trays_per_min_vsp_all:,.2f} trays/min  |  Avg/line: {avg_tpm_line_v:,.2f}")
             lines.append(f"CURRENT RATE (TOTAL): {trays_per_min_all:,.2f} trays/min")
             lines.append("")
 
@@ -1252,11 +1287,13 @@ class App(tk.Tk):
 
             lines.append(f"OSSID remaining trays: {trays_remaining_ossid:,.0f} -> {hours_needed(trays_remaining_ossid, trays_per_min_ossid_all)}")
             lines.append(f"REPAK remaining trays: {trays_remaining_repak:,.0f} -> {hours_needed(trays_remaining_repak, trays_per_min_repak_all)}")
+            lines.append(f"VSP remaining trays: {trays_remaining_vsp:,.0f} -> {hours_needed(trays_remaining_vsp, trays_per_min_vsp_all)}")
             lines.append(f"TOTAL remaining trays: {trays_remaining_total:,.0f} -> {hours_needed(trays_remaining_total, trays_per_min_all)}")
             lines.append("")
             lines.append("STANDARD (StdTPM + lines running):")
             lines.append(f"OSSID standard time: {fmt_duration_minutes(std_ossid_min)}")
             lines.append(f"REPAK standard time: {fmt_duration_minutes(std_repak_min)}")
+            lines.append(f"VSP standard time: {fmt_duration_minutes(std_vsp_min)}")
             lines.append(f"TOTAL standard time: {fmt_duration_minutes(std_total_min)}")
         else:
             end_txt = end_dt.strftime("%H:%M") if end_dt else "—"
@@ -1264,9 +1301,9 @@ class App(tk.Tk):
 
             lines.append(f"Start: {start_txt} | End: {end_txt} | Run mins so far: {run_mins:,.0f}")
             lines.append(
-                f"Trays/min (TOTAL): {trays_per_min_all:,.2f} | OSSID: {trays_per_min_ossid_all:,.2f} | REPAK: {trays_per_min_repak_all:,.2f}"
+                f"Trays/min (TOTAL): {trays_per_min_all:,.2f} | OSSID: {trays_per_min_ossid_all:,.2f} | REPAK: {trays_per_min_repak_all:,.2f} | VSP: {trays_per_min_vsp_all:,.2f}"
             )
-            lines.append(f"Avg TPM/line -> OSSID: {avg_tpm_line_o:,.2f} ({ossid_lines} lines) | REPAK: {avg_tpm_line_r:,.2f} ({repak_lines} lines)")
+            lines.append(f"Avg TPM/line -> OSSID: {avg_tpm_line_o:,.2f} ({ossid_lines} lines) | REPAK: {avg_tpm_line_r:,.2f} ({repak_lines} lines) | VSP: {avg_tpm_line_v:,.2f} ({vsp_lines} lines)")
             lines.append("")
 
             def fmt_finish(machine_name: str, rem_trays: float, rate: float, std_min: float):
@@ -1284,6 +1321,7 @@ class App(tk.Tk):
 
             lines.append(fmt_finish("OSSID", trays_remaining_ossid, trays_per_min_ossid_all, std_ossid_min))
             lines.append(fmt_finish("REPAK", trays_remaining_repak, trays_per_min_repak_all, std_repak_min))
+            lines.append(fmt_finish("VSP", trays_remaining_vsp, trays_per_min_vsp_all, std_vsp_min))
             lines.append(fmt_finish("TOTAL", trays_remaining_total, trays_per_min_all, std_total_min))
 
             if start_dt is not None and end_dt is not None:
@@ -1295,6 +1333,10 @@ class App(tk.Tk):
                     finish_r = now + timedelta(minutes=(trays_remaining_repak / trays_per_min_repak_all))
                     if finish_r > end_dt:
                         warn_lines.append(f"⚠ REPAK projected finish {finish_r.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
+                if trays_remaining_vsp > 0 and trays_per_min_vsp_all > 0:
+                    finish_v = now + timedelta(minutes=(trays_remaining_vsp / trays_per_min_vsp_all))
+                    if finish_v > end_dt:
+                        warn_lines.append(f"⚠ VSP projected finish {finish_v.strftime('%H:%M')} is after END TIME {end_dt.strftime('%H:%M')}")
                 if trays_remaining_total > 0 and trays_per_min_all > 0:
                     finish_t = now + timedelta(minutes=(trays_remaining_total / trays_per_min_all))
                     if finish_t > end_dt:
@@ -1314,19 +1356,24 @@ class App(tk.Tk):
             "trays_min": fmt_kpi(trays_per_min_all, 2) if trays_per_min_all > 0 else "—",
             "avg_line_o": fmt_kpi(avg_tpm_line_o, 2) if avg_tpm_line_o > 0 else "—",
             "avg_line_r": fmt_kpi(avg_tpm_line_r, 2) if avg_tpm_line_r > 0 else "—",
+            "avg_line_v": fmt_kpi(avg_tpm_line_v, 2) if avg_tpm_line_v > 0 else "—",
             "trs_needed": fmt_kpi(trays_remaining_total, 0),
             "planned": planned_txt,
             "trays_done_o": fmt_kpi(trays_completed_ossid, 0),
             "trays_done_r": fmt_kpi(trays_completed_repak, 0),
+            "trays_done_v": fmt_kpi(trays_completed_vsp, 0),
             "trays_rem_o": fmt_kpi(trays_remaining_ossid, 0),
             "trays_rem_r": fmt_kpi(trays_remaining_repak, 0),
+            "trays_rem_v": fmt_kpi(trays_remaining_vsp, 0),
             "tp_cases": fmt_kpi(cases_completed_total, 0),
             "cases_min": fmt_kpi(cases_per_min_display, 2) if cases_per_min_display > 0 else "—",
             "cs_needed": fmt_kpi(cases_remaining_total, 0),
             "cases_done_o": fmt_kpi(cases_completed_ossid, 0),
             "cases_done_r": fmt_kpi(cases_completed_repak, 0),
+            "cases_done_v": fmt_kpi(cases_completed_vsp, 0),
             "cases_rem_o": fmt_kpi(cases_remaining_ossid, 0),
             "cases_rem_r": fmt_kpi(cases_remaining_repak, 0),
+            "cases_rem_v": fmt_kpi(cases_remaining_vsp, 0),
             "estimates": "\n".join(lines),
             "warnings": "\n".join(warn_lines) if warn_lines else ""
         }
@@ -1342,13 +1389,14 @@ class App(tk.Tk):
         self.kpi_traysmin.set_value(payload["trays_min"])
         self.kpi_avg_ossid.set_value(payload["avg_line_o"])
         self.kpi_avg_repak.set_value(payload["avg_line_r"])
+        self.kpi_avg_vsp.set_value(payload["avg_line_v"])
         self.kpi_trs_needed.set_value(payload["trs_needed"])
         self.kpi_planned.set_value(payload["planned"])
 
-        self.tray_completed.set_values(payload["trays_done_o"], payload["trays_done_r"])
-        self.tray_remaining.set_values(payload["trays_rem_o"], payload["trays_rem_r"])
-        self.case_completed.set_values(payload["cases_done_o"], payload["cases_done_r"])
-        self.case_remaining.set_values(payload["cases_rem_o"], payload["cases_rem_r"])
+        self.tray_completed.set_values(payload["trays_done_o"], payload["trays_done_r"], payload["trays_done_v"])
+        self.tray_remaining.set_values(payload["trays_rem_o"], payload["trays_rem_r"], payload["trays_rem_v"])
+        self.case_completed.set_values(payload["cases_done_o"], payload["cases_done_r"], payload["cases_done_v"])
+        self.case_remaining.set_values(payload["cases_rem_o"], payload["cases_rem_r"], payload["cases_rem_v"])
 
         self.kpi_tpcases.set_value(payload["tp_cases"])
         self.kpi_casesmin.set_value(payload["cases_min"])
@@ -1485,7 +1533,7 @@ class App(tk.Tk):
 
             df2["TraysPerCase"] = pd.to_numeric(df2["TraysPerCase"], errors="coerce")
             df2["StdTPM"] = pd.to_numeric(df2["StdTPM"], errors="coerce")
-            df2["Machine"] = df2["Machine"].fillna("Unknown").astype(str).str.strip()
+            df2["Machine"] = df2["Machine"].fillna("Unknown").astype(str).str.strip().str.upper()
             df2["Frozen"] = df2["Frozen"].fillna("").astype(str).str.strip().str.upper()
             df2["Fed"] = df2["Fed"].fillna("").astype(str).str.strip()
 
@@ -1586,13 +1634,13 @@ class App(tk.Tk):
                 merged["Frozen"] = merged["Frozen"].astype(str).str.strip().str.upper()
                 merged = merged[merged["Frozen"] != "Y"].copy()
 
-            merged["Machine"] = merged["Machine"].fillna("Unknown").astype(str).str.strip()
+            merged["Machine"] = merged["Machine"].fillna("Unknown").astype(str).str.strip().str.upper()
             merged["Type"] = merged["Type"].fillna("Unknown")
             merged["Fed"] = merged["Fed"].fillna("").astype(str).str.strip()
             merged["DESC"] = merged["DESC"].fillna("")
 
             if machine_filter != "All":
-                merged = merged[merged["Machine"].astype(str).str.strip() == machine_filter].copy()
+                merged = merged[merged["Machine"].astype(str).str.strip().str.upper() == machine_filter.upper()].copy()
 
             merged["TraysProduced"] = merged["CasesProduced"] * merged["TraysPerCase"]
             self.last_production_df = merged.copy()
@@ -1691,6 +1739,9 @@ class App(tk.Tk):
 
         ttk.Label(frm, text="Repak Lines:").grid(row=r, column=10, sticky="w", **pad)
         ttk.Spinbox(frm, from_=1, to=7, textvariable=self.var_repak_lines, width=5).grid(row=r, column=11, sticky="w", **pad)
+
+        ttk.Label(frm, text="VSP Lines:").grid(row=r, column=12, sticky="w", **pad)
+        ttk.Spinbox(frm, from_=1, to=7, textvariable=self.var_vsp_lines, width=5).grid(row=r, column=13, sticky="w", **pad)
 
         r += 1
         ttk.Button(frm, text="Refresh Production", command=self.on_refresh_production).grid(row=r, column=0, sticky="w", **pad)
